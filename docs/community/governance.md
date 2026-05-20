@@ -39,11 +39,13 @@ Committers have write access and merge rights. They typically have deep expertis
 - [@linyueqian](https://github.com/linyueqian): TTS and Omni Support
 - [@lishunyang12](https://github.com/lishunyang12): Quantization and Configuration
 - [@princepride](https://github.com/princepride): Diffusion and Omni Support
+- [@RuixiangMa](https://github.com/RuixiangMa): Diffusion
 - [@SamitHuang](https://github.com/SamitHuang): RL and Diffusion
 - [@tzhouam](https://github.com/tzhouam): Engine and New Model Support
 - [@wtomin](https://github.com/wtomin): Diffusion and Parallelism
 - [@ZeldaHuang](https://github.com/ZeldaHuang): Omni Support
 - [@ZJY0516](https://github.com/ZJY0516): Diffusion and CustomOp
+- [@yuanheng-zhao](https://github.com/yuanheng-zhao): Diffusion and Omni Support
 
 ## Meetings
 

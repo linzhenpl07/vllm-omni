@@ -32,6 +32,14 @@ SYSTEM_PROMPTS: dict[tuple[str, str], str] = {
         "shape, size, texture, spatial relationships and motion/camera "
         "movements of the objects and background:"
     ),
+    # i2v reuses the t2v system prompt (matches upstream Lance PR #33's
+    # ``data/common.py`` where ``system_prompt_type in ("t2v", "i2v")``
+    # selects the same prompt pool).
+    ("i2v", "video"): (
+        "Describe the video by detailing the color, quantity, visible text, "
+        "shape, size, texture, spatial relationships and motion/camera "
+        "movements of the objects and background:"
+    ),
     ("image_edit", "image"): (
         "Describe the key features of the input image (color, shape, size, "
         "texture, objects, background), then explain how the user's text "
@@ -68,6 +76,7 @@ def render_lance_prompt(
     user_text: str,
     *,
     vision_token: str | None = None,
+    system_prompt: str | None = None,
 ) -> str:
     """Render a Lance-compatible user-side prompt.
 
@@ -75,15 +84,21 @@ def render_lance_prompt(
     ``x2t_image``, ``x2t_video``.  ``vision_token`` should be the visual
     placeholder to embed inside the user message (e.g. ``VIDEO_PAD`` or a
     ``VISION_START + VIDEO_PAD + VISION_END`` block); pass ``None`` for
-    text-only inputs.
+    text-only inputs.  ``system_prompt`` overrides the default task system
+    prompt — required for x2t QA examples whose upstream JSON carries a
+    per-example instruction (e.g. ``"Look at the image carefully and answer
+    the question."``); without it x2t falls back to the caption-style
+    default and the model describes instead of answering.
 
     Returns a single string ready to be tokenized; no further wrapping is
     needed by the caller.
     """
     # ``t2v`` / ``x2t_video`` / ``video_edit`` use video system prompts;
     # the rest are image.
-    vision_type = "video" if task in {"t2v", "x2t_video", "video_edit"} else "image"
-    sys_prompt = SYSTEM_PROMPTS.get((task, vision_type), "You are a helpful assistant.")
+    vision_type = "video" if task in {"t2v", "i2v", "x2t_video", "video_edit"} else "image"
+    sys_prompt = (
+        system_prompt if system_prompt else SYSTEM_PROMPTS.get((task, vision_type), "You are a helpful assistant.")
+    )
 
     if vision_token is None:
         user_msg = user_text

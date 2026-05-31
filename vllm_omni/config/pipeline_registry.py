@@ -65,14 +65,8 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_SINGLE_STAGE_PIPELINE",
     ),
-    # Lance (ByteDance) — BAGEL-lineage unified AR+diffusion.
-    # Single-stage is the runnable/registered topology; lance_two_stage is a
-    # follow-up (needs LanceConfig/LanceProcessor in the vllm package).
+    # Lance (ByteDance) — BAGEL-lineage unified AR+diffusion, single-stage DiT.
     "lance": (
-        "vllm_omni.model_executor.models.lance.pipeline",
-        "LANCE_SINGLE_STAGE_PIPELINE",
-    ),
-    "lance_two_stage": (
         "vllm_omni.model_executor.models.lance.pipeline",
         "LANCE_PIPELINE",
     ),

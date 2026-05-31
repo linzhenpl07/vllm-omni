@@ -833,13 +833,19 @@ class LanceWanVAE(nn.Module):
         """
         if padded_images.dim() == 4:
             video = padded_images.unsqueeze(2)  # B,C,1,H,W
+            squeeze_time = True  # image path: caller iterates 3-D latents
         elif padded_images.dim() == 5:
             video = padded_images
+            # video path: caller expects 4-D latents (C,T,H,W), even when T==1
+            # (e.g. video2video with a 1-frame reference clip).  Squeezing here
+            # would drop the temporal axis and break the downstream indexing
+            # ``latent[:, :t_lat, ...]`` in ``forward_cache_update_vae``.
+            squeeze_time = False
         else:
             raise ValueError(f"LanceWanVAE.encode expects 4-D BCHW or 5-D BCTHW, got {tuple(padded_images.shape)}")
         latent = self.encode_video(video, use_sample=True)
-        # B,48,t,h,w -> B,48,h,w when t == 1 (image path)
-        if latent.shape[2] == 1:
+        # B,48,t,h,w -> B,48,h,w when t == 1 (image path only)
+        if squeeze_time and latent.shape[2] == 1:
             return latent.squeeze(2)
         return latent
 

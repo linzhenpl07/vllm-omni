@@ -506,12 +506,16 @@ class LancePipeline(BagelPipeline):
         if isinstance(first_prompt, dict):
             modalities = first_prompt.get("modalities") or []
             mm_data = first_prompt.get("multi_modal_data") or {}
+        if "video" in modalities and mm_data.get("first_frame") is not None:
+            return self._forward_i2v(req)
         if "video" in modalities and mm_data.get("video") is not None:
             return self._forward_video_edit(req)
         if "video" in modalities:
             return self._forward_t2v(req)
         if "text" in modalities and mm_data.get("video") is not None:
             return self._forward_x2t_video(req)
+        if "text" in modalities and mm_data.get("image") is not None:
+            return self._forward_x2t_image(req)
         if "image" in modalities and (mm_data.get("img2img") is not None or mm_data.get("image") is not None):
             return self._forward_image_edit(req)
         # t2i falls through to BAGEL parent.  Inject Lance defaults if the
@@ -1000,13 +1004,386 @@ class LancePipeline(BagelPipeline):
             )
 
         img = self._decode_image_from_latent(self.bagel, self.vae, latents[0], image_shape)
+        # Put the PIL image into ``custom_output`` too — the orchestrator
+        # serializes ``custom_output`` across the IPC boundary but strips
+        # the bare ``output`` field, so consumers that only see
+        # ``outputs[0].output`` (e.g. gradio_demo) get ``None`` otherwise.
         return DiffusionOutput(
             output=img,
-            custom_output={"image_shape": image_shape},
+            custom_output={"image": img, "image_shape": image_shape},
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
     @torch.inference_mode()
+    @torch.inference_mode()
+    def _forward_i2v(self, req):
+        """Image-to-Video (upstream-faithful first-frame conditioning).
+
+        Mirrors upstream Lance PR #33's ``ff2v_sample`` + ``validation_gen_KVcache``
+        math byte-for-byte at the algorithmic level:
+
+          1. Treat the input image as 4 replicated pixel frames
+             ``(3, 4, H, W)``.  This matches upstream
+             ``vae_tensor[:, :4, :, :] = vae_image_tensor[:, 0:1, :, :].repeat(1, 4, 1, 1)``
+             — required because Wan2.2 VAE has temporal stride 4, so 4
+             pixel frames collapse to 1 latent frame.
+
+          2. VAE-encode → first latent frame at the image content.
+
+          3. Inject the encoded latent into ``packed_init_noises`` at
+             the first ``h_lat × w_lat`` token slice (frame 0).
+
+          4. Pass ``frame_condition_token_indexes = arange(0, h_lat*w_lat)``
+             to ``Bagel.generate_image`` so that:
+               * ``timestep[cond] = 0`` every iter (clean signal),
+               * ``x_t[cond]`` is restored verbatim after each
+                 velocity update (never denoised).
+
+        Plus a ViT+VAE-ref prefill of the same image (so the LLM also
+        attends to it through KV cache, matching upstream's
+        gen-pre-condition pass).
+        """
+
+        import numpy as _np
+        from PIL import Image as _PILImage
+
+        from vllm_omni.diffusion.data import DiffusionOutput
+
+        from .lance_transformer import NaiveCache
+        from .prompts import SYSTEM_PROMPTS
+
+        first_prompt = req.prompts[0]
+        assert isinstance(first_prompt, dict), "i2v requires dict-style prompt"
+        user_text = first_prompt.get("user_text")
+        rendered = first_prompt.get("prompt") or ""
+        if not user_text:
+            user_text = _extract_user_instruction(rendered)
+        mm_data = first_prompt.get("multi_modal_data") or {}
+        image_input = mm_data.get("first_frame")
+        if image_input is None:
+            raise ValueError("i2v requires multi_modal_data.first_frame.")
+
+        # Resolve image to (H, W, 3) uint8 RGB, then wrap as 1-frame video.
+        if isinstance(image_input, _PILImage.Image):
+            image_raw = _np.array(image_input.convert("RGB"))
+        elif isinstance(image_input, str):
+            image_raw = _np.array(_PILImage.open(image_input).convert("RGB"))
+        elif isinstance(image_input, _np.ndarray):
+            image_raw = image_input if image_input.ndim == 3 else image_input.squeeze()
+        else:
+            raise ValueError(f"Unsupported first_frame type {type(image_input)}")
+        video_raw = image_raw[None]  # (1, H, W, 3)
+
+        extra_args = first_prompt.get("extra_args") or {}
+        sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
+        extra_args = {**extra_args, **sp_extra}
+
+        # Output video shape — independent of input image dims.
+        num_frames_out = int(extra_args.get("num_frames", 61))
+        out_H = int(extra_args.get("video_height", 480))
+        out_W = int(extra_args.get("video_width", 848))
+        origin_fps = float(extra_args.get("origin_fps", 24.0))
+
+        # Upstream Lance i2v default is cfg_text_scale=4.0.  Note: vllm-omni's
+        # bf16 attention trajectory (vllm-native kernels vs upstream's
+        # HF-native ones) compounds per-layer drift that may DAMPEN prompt-
+        # directed motion for subtle prompts (e.g. micro facial expression).
+        # For such cases, boost cfg_text_scale to 10-15 via
+        # ``extra_args["cfg_text_scale"]`` to amplify prompt influence.
+        # WARNING: too-high cfg (e.g. 15) can cause anatomical distortion
+        # for natural-motion prompts (e.g. animals walking).  Tune per case.
+        cfg_text_scale = float(extra_args.get("cfg_text_scale", 4.0))
+        cfg_img_scale = float(extra_args.get("cfg_img_scale", 1.0))
+        # Upstream Lance i2v default (config/config_factory.py:cfg_interval):
+        # [0.4, 1.0] — CFG active in high-noise phase only.  Always-on CFG
+        # ``(0, 1)`` over-constrains the late-step velocity toward the
+        # conditioned first frame, suppressing subtle motion (e.g. micro
+        # facial expression changes in ex5).
+        cfg_interval = tuple(extra_args.get("cfg_interval", (0.4, 1.0)))
+        cfg_renorm_type = str(extra_args.get("cfg_renorm_type", "global"))
+        cfg_renorm_min = float(extra_args.get("cfg_renorm_min", 0.0))
+        timestep_shift = float(extra_args.get("timestep_shift", LANCE_DEFAULTS.timestep_shift))
+        num_timesteps = int(req.sampling_params.num_inference_steps or LANCE_DEFAULTS.num_timesteps)
+
+        # Bucket-resize + VAE/ViT preprocess the 1-frame "video" (image).
+        from .lance_transformer import LanceBagel as _LanceBagel
+
+        vae_video, vit_pixels, vit_grid_thw, _ = _LanceBagel._lance_video_preprocess(video_raw, origin_fps)
+        T_ref = int(vae_video.shape[1])
+        H_ref = int(vae_video.shape[2])
+        W_ref = int(vae_video.shape[3])
+
+        # Target output shape (independent of ref) — pass through the same
+        # VAE-aligned bucket so the gen latent dims are valid.  We pick H/W
+        # from extra_args and snap to the VAE downsample grid (×8 spatial,
+        # ×4 temporal for Wan2.2 VAE).  num_frames_out controls T.
+        # Wan2.2 latent dims: t_lat = (T - 1) // 4 + 1, h_lat = H // 8, w_lat = W // 8.
+        out_shape = (num_frames_out, out_H, out_W)
+
+        logger.info(
+            "Lance i2v: ref image %dx%d → 1-frame VAE %dx%dx%d, target output %dx%dx%d (T,H,W), user_text=%r",
+            image_raw.shape[0],
+            image_raw.shape[1],
+            T_ref,
+            H_ref,
+            W_ref,
+            num_frames_out,
+            out_H,
+            out_W,
+            user_text,
+        )
+
+        if req.sampling_params.seed is not None:
+            torch.manual_seed(req.sampling_params.seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed(req.sampling_params.seed)
+
+        gen_context = {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+        }
+        cfg_text_context = {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+        }
+
+        autocast_kwargs = dict(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+
+        def _raw_text_prefill(ctx, text_str):
+            text_ids = self.tokenizer.encode(text_str, add_special_tokens=False)
+            if not text_ids:
+                return
+            curr_kvlen = ctx["kv_lens"][0]
+            curr_rope = ctx["ropes"][0]
+            seq_len = len(text_ids)
+            inp = {
+                "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
+                "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
+                "packed_text_position_ids": torch.arange(
+                    curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
+                ),
+                "packed_text_indexes": torch.arange(
+                    curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device
+                ),
+                "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
+                "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
+            }
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_text(ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = [curr_kvlen + seq_len]
+            ctx["ropes"] = [curr_rope + seq_len]
+
+        def _vit_prefill(ctx):
+            inp, new_kvlens, new_rope = self.bagel.prepare_vit_videos(
+                curr_kvlens=ctx["kv_lens"],
+                curr_rope=ctx["ropes"],
+                videos=[video_raw],
+                new_token_ids=self.new_token_ids,
+                precomputed_vit=[(vit_pixels, vit_grid_thw)],
+            )
+            for k, v in inp.items():
+                if torch.is_tensor(v):
+                    inp[k] = v.to(self.device)
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_vit(ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = new_kvlens
+            ctx["ropes"] = new_rope
+
+        _ref_padded_latent_cache = {"v": None}
+
+        def _vae_transforms(_):
+            return vae_video
+
+        def _vae_prefill(ctx):
+            inp, new_kvlens, new_rope = self.bagel._lance_native_prepare_vae_images(
+                curr_kvlens=ctx["kv_lens"],
+                curr_rope=ctx["ropes"],
+                images=[vae_video],
+                transforms=_vae_transforms,
+                new_token_ids=self.new_token_ids,
+                is_video=True,
+            )
+            for k, v in inp.items():
+                if torch.is_tensor(v):
+                    inp[k] = v.to(self.device)
+            if _ref_padded_latent_cache["v"] is None:
+                _ref_padded_latent_cache["v"] = self.vae.encode(inp["padded_images"].to(self.device))
+            inp["precomputed_latent"] = _ref_padded_latent_cache["v"]
+            with torch.autocast(**autocast_kwargs):
+                ctx["past_key_values"] = self.bagel.forward_cache_update_vae(self.vae, ctx["past_key_values"], **inp)
+            ctx["kv_lens"] = new_kvlens
+            ctx["ropes"] = new_rope
+
+        # i2v system prompt (matches t2v wording per upstream).
+        sys_prompt = SYSTEM_PROMPTS[("i2v", "video")]
+        seg1_str = f"<|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n"
+        seg5_str = "<|im_end|>\n<|im_start|>assistant\n"
+
+        # Upstream Lance PR #33 i2v does NOT prefill the input image via
+        # ViT/VAE as a "reference".  The image conditioning happens entirely
+        # through the first-frame latent pin (cond positions in x_t set to
+        # VAE-encoded image, never updated through denoise loop).  Prefill
+        # is text-only: system prompt → user instruction → assistant header.
+        # Adding ViT/VAE prefill (which video_edit does) over-constrains the
+        # generation and prevents the prompt-driven motion from developing.
+        _raw_text_prefill(gen_context, seg1_str)
+        if cfg_text_scale > 1.0:
+            _raw_text_prefill(cfg_text_context, seg1_str)
+
+        # Snapshot rope BEFORE adding user text; gen latent will use this
+        # as its starting rope (matches upstream's modality==1≡2 trick).
+        rope_before_vae = gen_context["ropes"][0]
+        cfg_rope_before_vae = cfg_text_context["ropes"][0] if cfg_text_scale > 1.0 else rope_before_vae
+
+        _raw_text_prefill(gen_context, user_text)
+        _raw_text_prefill(gen_context, seg5_str)
+        if cfg_text_scale > 1.0:
+            _raw_text_prefill(cfg_text_context, seg5_str)
+
+        # GEN LATENT — at OUTPUT shape (not ref shape).  Place at rope
+        # starting from rope_before_vae (the modality==1≡2 trick).  The KV
+        # cache still holds the ref VAE at its original (smaller) rope
+        # range; the noise query's own rope just starts at the same
+        # ``rope_before_vae`` and extends through num_vid_tokens.
+        gen_input_lat = self.bagel.prepare_video_latent(
+            curr_kvlens=gen_context["kv_lens"],
+            curr_rope=[rope_before_vae],
+            video_shapes=[out_shape],
+            new_token_ids=self.new_token_ids,
+        )
+        for k, v in gen_input_lat.items():
+            if torch.is_tensor(v):
+                gen_input_lat[k] = v.to(self.device)
+        cfg_text_lat = self.bagel.prepare_video_latent_cfg(
+            curr_kvlens=cfg_text_context["kv_lens"],
+            curr_rope=[cfg_rope_before_vae],
+            video_shapes=[out_shape],
+        )
+        for k, v in cfg_text_lat.items():
+            if torch.is_tensor(v):
+                cfg_text_lat[k] = v.to(self.device)
+        cfg_img_lat = cfg_text_lat
+
+        # Deterministic init-noise regeneration.  ``prepare_video_latent``
+        # builds packed_init_noises via ``torch.randn(...)`` against the
+        # GLOBAL CUDA RNG state, which is contaminated by everything the
+        # prefill phase (text + ViT + VAE) consumed before this point.
+        # vllm-omni and upstream interleave RNG-consuming ops differently
+        # in prefill, so even with ``torch.manual_seed(seed)`` at the top
+        # the two sides land at different RNG positions when randn is called.
+        # Upstream uses ``torch.Generator(device).manual_seed(seed)`` AT the
+        # randn call (modeling/lance/lance.py:1533) so its noise depends
+        # only on the seed. Match that here.
+        if req.sampling_params.seed is not None:
+            noise_gen = torch.Generator(device=self.device).manual_seed(int(req.sampling_params.seed))
+            init_noises_tensor = gen_input_lat["packed_init_noises"]
+            gen_input_lat["packed_init_noises"] = torch.randn(
+                init_noises_tensor.shape,
+                generator=noise_gen,
+                device=self.device,
+                dtype=init_noises_tensor.dtype,
+            )
+
+        # ── First-frame conditioning: VAE-encode the FULL pixel-space
+        # target tensor (matches upstream Lance PR #33's ff2v_sample):
+        #
+        #   vae_tensor = torch.randn([3, num_frames, H, W])
+        #   vae_tensor[:, :4, :, :] = image.repeat(1, 4, 1, 1)
+        #
+        # Then VAE-encode the whole thing and take latent frame 0.  This is
+        # important — Wan2.2 VAE has temporal convolutions, so the first
+        # latent frame's value depends on neighbouring pixel frames (not
+        # just frames 0-3).  Encoding only the 4 image-replicated frames
+        # (which is what we did before) gives a *different* latent than
+        # upstream's full-sequence encode, and that delta produces an
+        # over-anchoring effect at i2v inference time (ex5 portrait case
+        # was visibly frozen because of this).
+        h_lat = int(out_H // self.bagel.latent_downsample)
+        w_lat = int(out_W // self.bagel.latent_downsample)
+        first_slice_n = h_lat * w_lat
+
+        from torchvision.transforms.functional import resize as _tv_resize
+
+        img_chw = torch.from_numpy(image_raw).permute(2, 0, 1).float() / 127.5 - 1.0  # (3, H, W) in [-1, 1]
+        img_chw = _tv_resize(img_chw, [out_H, out_W], antialias=True)
+
+        # Build the full pixel-space target tensor: random noise everywhere,
+        # except the first 4 pixel frames are the input image (replicated).
+        # Wan2.2 VAE collapses every 4 pixel frames → 1 latent frame, so the
+        # first latent slice will represent the conditioning image.
+        full_pixel_tensor = torch.randn((3, num_frames_out, out_H, out_W), dtype=torch.float32, device=self.device)
+        full_pixel_tensor[:, :4, :, :] = img_chw.to(self.device).unsqueeze(1).repeat(1, 4, 1, 1)
+        full_pixel_5d = full_pixel_tensor.unsqueeze(0)  # (1, 3, num_frames_out, H, W)
+
+        with torch.autocast(**autocast_kwargs):
+            image_latent_5d = self.vae.encode(full_pixel_5d)  # (1, 48, T_lat, h_lat, w_lat)
+
+        # Extract first latent frame in (h_lat, w_lat, 48) layout, then
+        # flatten to (h_lat*w_lat, 48) to match packed_init_noises[:first_slice_n].
+        if image_latent_5d.dim() == 5:
+            image_latent = image_latent_5d[0, :, 0, :, :]  # (48, h_lat, w_lat)
+        elif image_latent_5d.dim() == 4:
+            # encode may squeeze T=1 if the caller passed 4-D input — we
+            # passed 5-D so this branch shouldn't fire, but keep defensive.
+            image_latent = image_latent_5d[0]
+        else:
+            raise RuntimeError(f"Unexpected VAE-encoded shape {tuple(image_latent_5d.shape)}")
+        image_latent_packed = image_latent.permute(1, 2, 0).reshape(first_slice_n, -1)
+
+        init_noises = gen_input_lat["packed_init_noises"]
+        image_latent_packed = image_latent_packed.to(device=init_noises.device, dtype=init_noises.dtype)
+        init_noises[:first_slice_n] = image_latent_packed
+        gen_input_lat["packed_init_noises"] = init_noises
+
+        frame_condition_token_indexes = torch.arange(first_slice_n, dtype=torch.long, device=self.device)
+
+        logger.info(
+            "Lance i2v cond: latent grid h_lat=%d w_lat=%d -> pinning first %d tokens (frame 0) at VAE-encoded image",
+            h_lat,
+            w_lat,
+            first_slice_n,
+        )
+
+        with torch.autocast(**autocast_kwargs):
+            latents, *_ = self.bagel.generate_image(
+                past_key_values=gen_context["past_key_values"],
+                cfg_text_past_key_values=cfg_text_context["past_key_values"]
+                if cfg_text_scale > 1.0
+                else gen_context["past_key_values"],
+                cfg_img_past_key_values=gen_context["past_key_values"],
+                num_timesteps=num_timesteps,
+                timestep_shift=timestep_shift,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+                cfg_interval=cfg_interval,
+                cfg_renorm_type=cfg_renorm_type,
+                cfg_renorm_min=cfg_renorm_min,
+                **gen_input_lat,
+                cfg_text_packed_position_ids=cfg_text_lat["cfg_packed_position_ids"],
+                cfg_text_packed_query_indexes=cfg_text_lat["cfg_packed_query_indexes"],
+                cfg_text_key_values_lens=cfg_text_lat["cfg_key_values_lens"],
+                cfg_text_packed_key_value_indexes=cfg_text_lat["cfg_packed_key_value_indexes"],
+                cfg_img_packed_position_ids=cfg_img_lat["cfg_packed_position_ids"],
+                cfg_img_packed_query_indexes=cfg_img_lat["cfg_packed_query_indexes"],
+                cfg_img_key_values_lens=cfg_img_lat["cfg_key_values_lens"],
+                cfg_img_packed_key_value_indexes=cfg_img_lat["cfg_packed_key_value_indexes"],
+                frame_condition_token_indexes=frame_condition_token_indexes,
+            )
+
+        frames_np = self._decode_video_from_latent(self.bagel, self.vae, latents[0], out_shape)
+        frames = [Image.fromarray(f) for f in frames_np]
+        return DiffusionOutput(
+            output=frames[0],
+            custom_output={"video_frames": frames, "video_shape": out_shape},
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
     def _forward_video_edit(self, req):
         """Video edit: reference video + text prompt → modified video.
 
@@ -1335,10 +1712,10 @@ class LancePipeline(BagelPipeline):
     def _forward_x2t_video(self, req):
         """Video understanding (x2t_video): video → text caption / VQA answer.
 
-        Mirrors :meth:`_forward_t2v` for the prefill / generation
-        bookkeeping but routes the video through the Qwen2.5-VL ViT (no VAE
-        prefill — Lance's training has Wan2.2 latents only for image_edit /
-        video_edit, not for understanding).
+        Builds the prefill in three segments matching upstream's chat
+        template — see :meth:`_forward_x2t_image` for the rationale on
+        why naïve concatenation (text prompt → ViT) lands the EOS / vit
+        markers in the wrong place and degrades the answer format.
         """
 
         from vllm_omni.diffusion.data import DiffusionOutput
@@ -1347,7 +1724,6 @@ class LancePipeline(BagelPipeline):
 
         first_prompt = req.prompts[0]
         assert isinstance(first_prompt, dict), "x2t_video requires dict-style prompt"
-        prompt = first_prompt.get("prompt") or ""
         video_input = (first_prompt.get("multi_modal_data") or {}).get("video")
         if video_input is None:
             raise ValueError("x2t_video requires multi_modal_data.video to be a video tensor/array/path.")
@@ -1366,40 +1742,32 @@ class LancePipeline(BagelPipeline):
         do_sample = bool(extra_args.get("do_sample", False))
         text_temperature = float(extra_args.get("text_temperature", 0.3))
 
+        prefix_text, suffix_text = self._split_x2t_prompt(
+            first_prompt.get("prompt") or "",
+            user_text_override=extra_args.get("user_text"),
+            system_prompt_override=extra_args.get("system_prompt"),
+            default_system_prompt="Watch the video carefully and answer the question.",
+        )
+
         if req.sampling_params.seed is not None:
             torch.manual_seed(req.sampling_params.seed)
             if self.device.type == "cuda":
                 torch.cuda.manual_seed(req.sampling_params.seed)
 
-        # ---- Text-prompt prefill ----
+        autocast_kwargs = dict(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-        if prompt:
-            gen_input_text, newlens, new_rope = self.bagel.prepare_prompts(
-                curr_kvlens=gen_context["kv_lens"],
-                curr_rope=gen_context["ropes"],
-                prompts=[prompt],
-                tokenizer=self.tokenizer,
-                new_token_ids=self.new_token_ids,
-            )
-            for k, v in gen_input_text.items():
-                if torch.is_tensor(v):
-                    gen_input_text[k] = v.to(self.device)
-            with torch.autocast(
-                device_type=self.device.type,
-                enabled=self.device.type != "cpu",
-                dtype=self.od_config.dtype,
-            ):
-                gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                    gen_context["past_key_values"], **gen_input_text
-                )
-            gen_context["kv_lens"] = newlens
-            gen_context["ropes"] = new_rope
 
-        # ---- Multi-frame ViT prefill ----
+        self._x2t_raw_text_prefill(gen_context, prefix_text, autocast_kwargs)
+
         gen_input_vit, newlens_vit, new_rope_vit = self.bagel.prepare_vit_videos(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
@@ -1409,27 +1777,20 @@ class LancePipeline(BagelPipeline):
         for k, v in gen_input_vit.items():
             if torch.is_tensor(v):
                 gen_input_vit[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
+        with torch.autocast(**autocast_kwargs):
             gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
                 gen_context["past_key_values"], **gen_input_vit
             )
         gen_context["kv_lens"] = newlens_vit
         gen_context["ropes"] = new_rope_vit
 
-        # ---- Text generation ----
-        start_input = self.bagel.prepare_start_tokens(gen_context["kv_lens"], gen_context["ropes"], self.new_token_ids)
+        self._x2t_raw_text_prefill(gen_context, suffix_text, autocast_kwargs)
+
+        start_input = self._x2t_prepare_assistant_start(gen_context)
         for k, v in start_input.items():
             if torch.is_tensor(v):
                 start_input[k] = v.to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            enabled=self.device.type != "cpu",
-            dtype=self.od_config.dtype,
-        ):
+        with torch.autocast(**autocast_kwargs):
             token_ids = self.bagel.generate_text(
                 past_key_values=gen_context["past_key_values"],
                 max_length=max_text_tokens,
@@ -1442,12 +1803,240 @@ class LancePipeline(BagelPipeline):
         text_output = decoded.split("<|im_end|>")[0]
         if "<|im_start|>" in text_output:
             text_output = text_output.split("<|im_start|>")[-1]
+        # Strip the leading newline that was fed as the start token (see
+        # ``_x2t_prepare_assistant_start``); see x2t_image for rationale.
+        text_output = text_output.lstrip("\n")
         logger.info("Lance x2t_video: generated %d tokens", token_ids.shape[0])
         return DiffusionOutput(
             output=text_output,
             custom_output={"text_output": text_output},
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
+
+    @torch.inference_mode()
+    def _forward_x2t_image(self, req):
+        """Image understanding (x2t_image): image + question → text answer.
+
+        Builds the prefill in three text/vit segments matching upstream's
+        chat-template layout::
+
+            <|im_start|>system\\n{system}<|im_end|>\\n<|im_start|>user\\n
+            <|vision_start|>{N×ViT}<|vision_end|>
+            {question}<|im_end|>\\n<|im_start|>assistant\\n
+
+        ``prepare_prompts`` wraps the *whole* string with ``[bos]…[eos]``
+        and ``prepare_vit_images`` adds ``<|vision_start|>``/``<|vision_end|>``
+        of its own — concatenating them naïvely (text first, then vit)
+        produced ``…assistant\\n[eos]<|vision_start|>{ViT}<|vision_end|>``,
+        so the model saw an EOS right after the assistant tag and a
+        bare ``<|video_pad|>`` token inside the user message.  Segmenting
+        the text into prefix/suffix and sliding the vit prefill between
+        them puts the markers exactly where Lance was trained on.
+        """
+
+        from PIL import Image as _PIL_Image
+
+        from vllm_omni.diffusion.data import DiffusionOutput
+
+        from .lance_transformer import NaiveCache
+
+        first_prompt = req.prompts[0]
+        assert isinstance(first_prompt, dict), "x2t_image requires dict-style prompt"
+        image_input = (first_prompt.get("multi_modal_data") or {}).get("image")
+        if image_input is None:
+            raise ValueError("x2t_image requires multi_modal_data.image to be a PIL image / array / path.")
+        if isinstance(image_input, str):
+            image_input = _PIL_Image.open(image_input).convert("RGB")
+        images = [image_input]
+
+        extra_args = first_prompt.get("extra_args") or {}
+        sp_extra = getattr(req.sampling_params, "extra_args", {}) or {}
+        extra_args = {**extra_args, **sp_extra}
+        max_text_tokens = int(extra_args.get("max_think_tokens", 256))
+        do_sample = bool(extra_args.get("do_sample", False))
+        text_temperature = float(extra_args.get("text_temperature", 0.3))
+
+        prefix_text, suffix_text = self._split_x2t_prompt(
+            first_prompt.get("prompt") or "",
+            user_text_override=extra_args.get("user_text"),
+            system_prompt_override=extra_args.get("system_prompt"),
+            default_system_prompt="Look at the image carefully and answer the question.",
+        )
+
+        if req.sampling_params.seed is not None:
+            torch.manual_seed(req.sampling_params.seed)
+            if self.device.type == "cuda":
+                torch.cuda.manual_seed(req.sampling_params.seed)
+
+        def vit_transforms(img):
+            return self.image_processor(images=img, return_tensors="pt").pixel_values[0]
+
+        autocast_kwargs = dict(
+            device_type=self.device.type,
+            enabled=self.device.type != "cpu",
+            dtype=self.od_config.dtype,
+        )
+
+        gen_context = {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
+        }
+
+        self._x2t_raw_text_prefill(gen_context, prefix_text, autocast_kwargs)
+
+        gen_input_vit, newlens_vit, new_rope_vit = self.bagel.prepare_vit_images(
+            curr_kvlens=gen_context["kv_lens"],
+            curr_rope=gen_context["ropes"],
+            images=images,
+            transforms=vit_transforms,
+            new_token_ids=self.new_token_ids,
+        )
+        for k, v in gen_input_vit.items():
+            if torch.is_tensor(v):
+                gen_input_vit[k] = v.to(self.device)
+        with torch.autocast(**autocast_kwargs):
+            gen_context["past_key_values"] = self.bagel.forward_cache_update_vit(
+                gen_context["past_key_values"], **gen_input_vit
+            )
+        gen_context["kv_lens"] = newlens_vit
+        gen_context["ropes"] = new_rope_vit
+
+        self._x2t_raw_text_prefill(gen_context, suffix_text, autocast_kwargs)
+
+        start_input = self._x2t_prepare_assistant_start(gen_context)
+        for k, v in start_input.items():
+            if torch.is_tensor(v):
+                start_input[k] = v.to(self.device)
+        with torch.autocast(**autocast_kwargs):
+            token_ids = self.bagel.generate_text(
+                past_key_values=gen_context["past_key_values"],
+                max_length=max_text_tokens,
+                do_sample=do_sample,
+                temperature=text_temperature,
+                end_token_id=self.new_token_ids["eos_token_id"],
+                **start_input,
+            )
+        decoded = self.tokenizer.decode(token_ids[:, 0].tolist())
+        text_output = decoded.split("<|im_end|>")[0]
+        if "<|im_start|>" in text_output:
+            text_output = text_output.split("<|im_start|>")[-1]
+        # Strip the leading newline that was fed as the start token (see
+        # ``_x2t_prepare_assistant_start``); it always sits at index 0 of
+        # the generated sequence and is just plumbing, not model output.
+        text_output = text_output.lstrip("\n")
+        logger.info("Lance x2t_image: generated %d tokens", token_ids.shape[0])
+        return DiffusionOutput(
+            output=text_output,
+            custom_output={"text_output": text_output},
+            stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
+        )
+
+    @staticmethod
+    def _split_x2t_prompt(
+        rendered_prompt: str,
+        *,
+        user_text_override: str | None,
+        system_prompt_override: str | None,
+        default_system_prompt: str,
+    ) -> tuple[str, str]:
+        """Split a rendered Lance x2t chat template at the vision block.
+
+        Accepts either a pre-rendered template containing
+        ``<|vision_start|>…<|vision_end|>`` (the historical
+        ``render_lance_prompt`` output) or recovers prefix/suffix from
+        ``user_text_override`` + ``system_prompt_override`` when the
+        template was not pre-rendered.  Returns ``(prefix, suffix)`` such
+        that the segmented prefill is ``prefix + ViT + suffix``.
+
+        ``suffix`` deliberately ends at ``assistant`` (NOT ``assistant\\n``):
+        :meth:`Bagel.prepare_start_tokens` injects ``<|im_start|>`` (Qwen
+        bos == 151644) as the first generation step, and ``\\n<|im_start|>``
+        right after ``assistant\\n`` tells the model "begin a new
+        message" — it answers with an immediate ``<|im_end|>`` and
+        produces an empty caption.  Holding the trailing ``\\n`` out of
+        the prefill (it gets re-applied via ``_x2t_prepare_assistant_start``)
+        lets the next forward step start *inside* the assistant turn
+        instead of opening a fresh one.
+        """
+        sys_prompt = system_prompt_override or default_system_prompt
+
+        if user_text_override is not None:
+            user_text = user_text_override
+        elif "<|vision_start|>" in rendered_prompt and "<|vision_end|>" in rendered_prompt:
+            _, _, after_vis_end = rendered_prompt.partition("<|vision_end|>")
+            user_text, _, _ = after_vis_end.partition("<|im_end|>")
+        else:
+            # No vision markers and no override — best-effort fallback:
+            # treat the entire prompt as the user question and rebuild
+            # the chat scaffolding.
+            user_text = rendered_prompt
+
+        prefix = f"<|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n"
+        suffix = f"{user_text}<|im_end|>\n<|im_start|>assistant"
+        return prefix, suffix
+
+    def _x2t_prepare_assistant_start(self, gen_context):
+        """Build a ``generate_text`` start input where the first fed token
+        is the newline that closes ``<|im_start|>assistant\\n``.
+
+        :meth:`Bagel.prepare_start_tokens` would instead feed
+        ``<|im_start|>``, opening a fresh message right after the
+        assistant tag and triggering an immediate EOS on Lance_3B (the
+        image-only checkpoint is stricter about chat-turn framing than
+        the video model, which happens to recover).  Feeding ``\\n``
+        keeps the model *inside* the assistant turn so the next argmax
+        is the first answer token.
+        """
+        newline_ids = self.tokenizer.encode("\n", add_special_tokens=False)
+        assert len(newline_ids) == 1, f"expected single token for '\\n', got {newline_ids!r}"
+        nl_id = newline_ids[0]
+
+        curr_kvlens = gen_context["kv_lens"]
+        curr_ropes = gen_context["ropes"]
+        packed_key_value_indexes: list[int] = []
+        packed_query_position_ids: list[int] = []
+        packed_start_tokens: list[int] = []
+        curr = 0
+        for curr_kvlen, curr_position_id in zip(curr_kvlens, curr_ropes):
+            packed_key_value_indexes.extend(range(curr, curr + curr_kvlen))
+            packed_start_tokens.append(nl_id)
+            packed_query_position_ids.append(curr_position_id)
+            curr += curr_kvlen
+        return {
+            "packed_start_tokens": torch.tensor(packed_start_tokens, dtype=torch.long),
+            "packed_query_position_ids": torch.tensor(packed_query_position_ids, dtype=torch.long),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int),
+            "packed_key_value_indexes": torch.tensor(packed_key_value_indexes, dtype=torch.long),
+        }
+
+    def _x2t_raw_text_prefill(self, gen_context, text_str, autocast_kwargs):
+        """Tokenize ``text_str`` *raw* (no bos/eos wrapping) and append it
+        to ``gen_context``'s KV cache.  ``prepare_prompts`` is unusable
+        here because it would inject ``[bos] + ids + [eos]`` around each
+        segment, breaking the chat template framing."""
+        if not text_str:
+            return
+        text_ids = self.tokenizer.encode(text_str, add_special_tokens=False)
+        if not text_ids:
+            return
+        curr_kvlen = gen_context["kv_lens"][0]
+        curr_rope = gen_context["ropes"][0]
+        seq_len = len(text_ids)
+        inp = {
+            "text_token_lens": torch.tensor([seq_len], dtype=torch.int, device=self.device),
+            "packed_text_ids": torch.tensor(text_ids, dtype=torch.long, device=self.device),
+            "packed_text_position_ids": torch.arange(
+                curr_rope, curr_rope + seq_len, dtype=torch.long, device=self.device
+            ),
+            "packed_text_indexes": torch.arange(curr_kvlen, curr_kvlen + seq_len, dtype=torch.long, device=self.device),
+            "packed_key_value_indexes": torch.arange(0, curr_kvlen, dtype=torch.long, device=self.device),
+            "key_values_lens": torch.tensor([curr_kvlen], dtype=torch.int, device=self.device),
+        }
+        with torch.autocast(**autocast_kwargs):
+            gen_context["past_key_values"] = self.bagel.forward_cache_update_text(gen_context["past_key_values"], **inp)
+        gen_context["kv_lens"] = [curr_kvlen + seq_len]
+        gen_context["ropes"] = [curr_rope + seq_len]
 
     @staticmethod
     def _decode_video_from_latent(

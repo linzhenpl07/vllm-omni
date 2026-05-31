@@ -33,7 +33,7 @@ def parse_args():
     p.add_argument(
         "--modality",
         default="text2img",
-        choices=["text2img", "img2text", "text2video", "video2text", "img2img", "video2video"],
+        choices=["text2img", "img2text", "text2video", "video2text", "img2img", "video2video", "image2video"],
         help="Lance single-stage modality.",
     )
     p.add_argument("--image-path", type=str, default=None, help="Input image for img2text.")
@@ -43,7 +43,9 @@ def parse_args():
     p.add_argument("--video-width", type=int, default=768, help="Video frame width.")
     p.add_argument("--height", type=int, default=None, help="Image height (t2i). Default = max_hw (1024).")
     p.add_argument("--width", type=int, default=None, help="Image width (t2i). Default = max_hw (1024).")
-    p.add_argument("--fps", type=int, default=8, help="Output video FPS when saving MP4.")
+    p.add_argument(
+        "--fps", type=int, default=12, help="Output video FPS when saving MP4 (matches upstream Lance's save_fps=12)."
+    )
     p.add_argument("--output", type=str, default=".", help="Output directory.")
     p.add_argument("--steps", type=int, default=30, help="Denoising steps (Lance default 30).")
     p.add_argument("--cfg-text-scale", type=float, default=4.0, help="Text CFG scale (Lance default 4.0).")
@@ -63,6 +65,17 @@ def parse_args():
         type=float,
         default=0.8,
         help="Sampling temperature for x2t generation. Lance frequently emits an immediate EOS below ~0.7; 0.8 is a good default.",
+    )
+    p.add_argument(
+        "--system-prompt",
+        type=str,
+        default=None,
+        help=(
+            "Override the task system prompt (used by x2t_image / x2t_video for "
+            'per-example QA instructions like "Look at the image carefully and '
+            'answer the question."; without it x2t falls back to a '
+            "caption-style default and the model describes instead of answering)."
+        ),
     )
     p.add_argument(
         "--deploy-config",
@@ -98,6 +111,33 @@ def _format_text2video_prompts(prompts, num_frames, video_h, video_w):
     return [{"prompt": render_lance_prompt("t2v", p), "modalities": ["video"], "extra_args": extra} for p in prompts]
 
 
+def _format_image2video_prompts(prompts, image_path, num_frames, video_h, video_w):
+    """Image-to-Video (no first-frame pin): image + text → long video.
+
+    Passes the input image via ``multi_modal_data.first_frame``.  The pipeline
+    treats it as a 1-frame reference (VAE+ViT prefill) and generates a fresh
+    multi-frame video at the requested ``num_frames`` × ``video_h`` ×
+    ``video_w`` shape.
+    """
+    import os as _os
+
+    if not image_path or not _os.path.exists(image_path):
+        raise ValueError(f"image2video requires --image-path pointing to an existing file, got: {image_path}")
+    from PIL import Image as _Image
+
+    img = _Image.open(image_path).convert("RGB")
+    extra = {"num_frames": num_frames, "video_height": video_h, "video_width": video_w}
+    return [
+        {
+            "prompt": render_lance_prompt("i2v", p, vision_token=_VISION_BLOCK),
+            "multi_modal_data": {"first_frame": img},
+            "modalities": ["video"],
+            "extra_args": extra,
+        }
+        for p in prompts
+    ]
+
+
 def _format_img2img_prompts(prompts, image_path):
     import os as _os
 
@@ -121,14 +161,12 @@ def _format_video2video_prompts(prompts, video_path, num_frames, video_h, video_
 
     if not video_path or not _os.path.exists(video_path):
         raise ValueError(f"video2video requires --video-path pointing to an existing file, got: {video_path}")
-    import imageio.v3 as iio
 
-    video = iio.imread(video_path)
     extra = {"num_frames": num_frames, "video_height": video_h, "video_width": video_w}
     return [
         {
             "prompt": render_lance_prompt("video_edit", p, vision_token=_VISION_BLOCK),
-            "multi_modal_data": {"video": video},
+            "multi_modal_data": {"video": video_path},
             "modalities": ["video"],
             "extra_args": extra,
         }
@@ -136,7 +174,7 @@ def _format_video2video_prompts(prompts, video_path, num_frames, video_h, video_
     ]
 
 
-def _format_video2text_prompts(prompts, video_path):
+def _format_video2text_prompts(prompts, video_path, system_prompt=None):
     import os as _os
 
     if not video_path or not _os.path.exists(video_path):
@@ -146,7 +184,7 @@ def _format_video2text_prompts(prompts, video_path):
     video = iio.imread(video_path)
     return [
         {
-            "prompt": render_lance_prompt("x2t_video", p, vision_token=_VISION_BLOCK),
+            "prompt": render_lance_prompt("x2t_video", p, vision_token=_VISION_BLOCK, system_prompt=system_prompt),
             "multi_modal_data": {"video": video},
             "modalities": ["text"],
         }
@@ -154,7 +192,7 @@ def _format_video2text_prompts(prompts, video_path):
     ]
 
 
-def _format_img2text_prompts(prompts, image_path):
+def _format_img2text_prompts(prompts, image_path, system_prompt=None):
     from PIL import Image
 
     if not image_path or not os.path.exists(image_path):
@@ -162,7 +200,7 @@ def _format_img2text_prompts(prompts, image_path):
     img = Image.open(image_path).convert("RGB")
     return [
         {
-            "prompt": render_lance_prompt("x2t_image", p, vision_token=_VISION_BLOCK),
+            "prompt": render_lance_prompt("x2t_image", p, vision_token=_VISION_BLOCK, system_prompt=system_prompt),
             "multi_modal_data": {"image": img},
             "modalities": ["text"],
         }
@@ -184,22 +222,38 @@ def main():
 
     from vllm_omni.entrypoints.omni import Omni
 
+    # Video modalities require the Lance_3B_Video checkpoint (3D
+    # latent_pos_embed shaped (126976, 2048)).  Without it, vllm-omni silently
+    # loads Lance_3B (4096, 2048) — the image-only table — and any t_lat >= 1
+    # immediately indexes out of bounds.  Rewrite the model path so
+    # LancePipeline._select_video_variant picks the video subfolder.
+    resolved_model = args.model
+    if args.modality in ("text2video", "video2video", "video2text", "image2video"):
+        if not str(resolved_model).rstrip("/").endswith("Lance_3B_Video"):
+            candidate = os.path.join(resolved_model, "Lance_3B_Video")
+            if os.path.isdir(candidate):
+                resolved_model = candidate
+
     omni_kwargs = vars(args).copy()
     omni_kwargs["deploy_config"] = args.deploy_config
-    omni_kwargs["model"] = args.model
+    omni_kwargs["model"] = resolved_model
     omni = Omni(**omni_kwargs)
 
     if args.modality == "img2text":
-        formatted = _format_img2text_prompts(prompts, args.image_path)
+        formatted = _format_img2text_prompts(prompts, args.image_path, system_prompt=args.system_prompt)
     elif args.modality == "text2video":
         formatted = _format_text2video_prompts(prompts, args.num_frames, args.video_height, args.video_width)
     elif args.modality == "video2text":
-        formatted = _format_video2text_prompts(prompts, args.video_path)
+        formatted = _format_video2text_prompts(prompts, args.video_path, system_prompt=args.system_prompt)
     elif args.modality == "img2img":
         formatted = _format_img2img_prompts(prompts, args.image_path)
     elif args.modality == "video2video":
         formatted = _format_video2video_prompts(
             prompts, args.video_path, args.num_frames, args.video_height, args.video_width
+        )
+    elif args.modality == "image2video":
+        formatted = _format_image2video_prompts(
+            prompts, args.image_path, args.num_frames, args.video_height, args.video_width
         )
     else:
         formatted = _format_text2img_prompts(prompts)
@@ -234,7 +288,7 @@ def main():
             print(f"[Output {i}] {text}")
         return
 
-    if args.modality in ("text2video", "video2video"):
+    if args.modality in ("text2video", "video2video", "image2video"):
         for i, req_output in enumerate(outputs):
             custom = getattr(req_output, "custom_output", None) or {}
             frames = custom.get("video_frames")

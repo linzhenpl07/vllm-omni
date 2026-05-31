@@ -134,12 +134,6 @@ _OMNI_MODELS = {
         "bagel",
         "OmniBagelForConditionalGeneration",
     ),
-    ## lance (ByteDance) — BAGEL-lineage; two-stage AR arch (follow-up)
-    "OmniLanceForConditionalGeneration": (
-        "lance",
-        "lance",
-        "OmniLanceForConditionalGeneration",
-    ),
     "HunyuanImage3ForCausalMM": (
         "hunyuan_image3",
         "hunyuan_image3",

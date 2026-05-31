@@ -1819,8 +1819,20 @@ class Bagel(nn.Module):
         return_trajectory_latents: bool = False,
         scheduler: object | None = None,
         scheduler_kwargs: dict | None = None,
+        # Lance i2v: tokens to freeze at their initial (encoded-image)
+        # value throughout the denoise loop.  Matches upstream's
+        # ``mse_loss_indexes``-exclusion behaviour from PR #33: cond
+        # positions are never updated and get ``timestep=0``.
+        frame_condition_token_indexes: torch.LongTensor | None = None,
     ):
         x_t = packed_init_noises
+        # Snapshot the pinned subtensor BEFORE the denoise loop touches
+        # x_t; the cond positions in packed_init_noises hold the
+        # VAE-encoded conditioning latent that must be preserved verbatim.
+        pinned_x_t = None
+        if frame_condition_token_indexes is not None:
+            frame_condition_token_indexes = frame_condition_token_indexes.to(x_t.device).long()
+            pinned_x_t = x_t[frame_condition_token_indexes].clone()
 
         # Use num_timesteps + 1 sample points so we get `num_timesteps` denoise
         # steps after dropping the terminal t=0 (which has no dt).  Upstream
@@ -1887,6 +1899,12 @@ class Bagel(nn.Module):
                 trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            if frame_condition_token_indexes is not None:
+                # Cond positions stay at t=0 (clean signal).  Matches upstream
+                # PR #33 lance.py line 1605:
+                #     timestep[current_vae_mse_indexes_local_in_vae] = t
+                # (cond positions remain at the ``torch.zeros`` init value).
+                timestep[frame_condition_token_indexes] = 0.0
                 in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
                 cfg_text_scale_ = cfg_text_scale if in_cfg_window else 1.0
                 cfg_img_scale_ = cfg_img_scale if in_cfg_window else 1.0
@@ -1959,6 +1977,12 @@ class Bagel(nn.Module):
                 trajectory_latents.append(x_t.clone())
             for i, t in enumerate(timesteps):
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            if frame_condition_token_indexes is not None:
+                # Cond positions stay at t=0 (clean signal).  Matches upstream
+                # PR #33 lance.py line 1605:
+                #     timestep[current_vae_mse_indexes_local_in_vae] = t
+                # (cond positions remain at the ``torch.zeros`` init value).
+                timestep[frame_condition_token_indexes] = 0.0
                 v_t = self.forward_single_branch(
                     x_t=x_t,
                     timestep=timestep,
@@ -2051,6 +2075,12 @@ class Bagel(nn.Module):
 
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            if frame_condition_token_indexes is not None:
+                # Cond positions stay at t=0 (clean signal).  Matches upstream
+                # PR #33 lance.py line 1605:
+                #     timestep[current_vae_mse_indexes_local_in_vae] = t
+                # (cond positions remain at the ``torch.zeros`` init value).
+                timestep[frame_condition_token_indexes] = 0.0
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
                 cfg_img_scale_ = cfg_img_scale
@@ -2084,6 +2114,12 @@ class Bagel(nn.Module):
                     trajectory_log_probs.append(out.log_prob)
             else:
                 x_t = x_t - v_t.to(x_t.device) * dts[i]  # velocity pointing from data to noise
+                if pinned_x_t is not None:
+                    # i2v: restore cond positions to their encoded-image
+                    # latent.  Matches upstream PR #33 lance.py line 1712:
+                    #     x_t[mse_indexes] = x_t[mse_indexes] - v_t[mse_indexes] * dts[i]
+                    # (cond positions are excluded from the update).
+                    x_t[frame_condition_token_indexes] = pinned_x_t
             if return_trajectory_latents:
                 trajectory_latents.append(x_t.clone())
                 trajectory_timesteps.append(timesteps[i])
@@ -2124,6 +2160,7 @@ class Bagel(nn.Module):
         return_trajectory_latents: bool = False,
         scheduler: object | None = None,
         scheduler_kwargs: dict | None = None,
+        frame_condition_token_indexes: torch.LongTensor | None = None,
     ):
         """CFG parallel denoising loop: each rank computes one CFG branch.
 
@@ -2192,6 +2229,12 @@ class Bagel(nn.Module):
 
         for i, t in enumerate(timesteps):
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            if frame_condition_token_indexes is not None:
+                # Cond positions stay at t=0 (clean signal).  Matches upstream
+                # PR #33 lance.py line 1605:
+                #     timestep[current_vae_mse_indexes_local_in_vae] = t
+                # (cond positions remain at the ``torch.zeros`` init value).
+                timestep[frame_condition_token_indexes] = 0.0
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
             if use_cfg_this_step:
@@ -2353,7 +2396,7 @@ class Bagel(nn.Module):
             packed_sequence = packed_text_embedding.new_zeros((int(local_seqlens.sum()), self.hidden_size))
             packed_sequence[local_text_indexes] = packed_text_embedding
 
-            assert timestep.unique().shape[0] == 1
+            # i2v relaxes this: per-token timestep (cond=0, noncond=t) is valid.
             packed_pos_embed = self.latent_pos_embed(local_vae_pos_ids)
             local_timestep = timestep[: local_x_t.shape[0]]
             packed_timestep_embeds = self.time_embedder(local_timestep)
@@ -2411,7 +2454,7 @@ class Bagel(nn.Module):
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
-        assert timestep.unique().shape[0] == 1
+        # i2v relaxes this: per-token timestep (cond=0, noncond=t) is valid.
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(timestep)
         x_t_emb = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed
@@ -2469,7 +2512,7 @@ class Bagel(nn.Module):
         packed_sequence = packed_text_embedding.new_zeros((sum(packed_seqlens), self.hidden_size))
         packed_sequence[packed_text_indexes] = packed_text_embedding
 
-        assert timestep.unique().shape[0] == 1
+        # i2v relaxes this: per-token timestep (cond=0, noncond=t) is valid.
         packed_pos_embed = self.latent_pos_embed(packed_vae_position_ids)
         packed_timestep_embeds = self.time_embedder(timestep)
         x_t = self.vae2llm(x_t) + packed_timestep_embeds + packed_pos_embed

@@ -6,7 +6,7 @@ Each item is a concrete check to run against the diff. ✗ = fix before PR. ⚠ 
 
 ## All PRs: Title Format (check first)
 
-PR title must follow the project convention documented in CLAUDE.md:
+PR title must follow the project convention documented in `docs/contributing/README.md`:
 
 | Prefix | Applies to |
 |--------|-----------|

@@ -1,4 +1,6 @@
 <!-- markdownlint-disable -->
+**Before submitting:** run `/precheck-pr` in Claude Code for a self-check against project conventions — catches dead code, missing benchmarks, and title format issues.
+
 PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTTOM) HAVE BEEN CONSIDERED.
 
 ## Purpose
@@ -18,7 +20,5 @@ PLEASE FILL IN THE PR DESCRIPTION HERE ENSURING ALL CHECKLIST ITEMS (AT THE BOTT
 - [ ] (Optional) Release notes update. If your change is user-facing, please update the release notes draft.
 </details>
 
-**BEFORE SUBMITTING:**
-- Run `/precheck-pr` in Claude Code for a self-check against project conventions — catches dead code, missing benchmarks, and title format issues.
-- Please read <https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md>
+**BEFORE SUBMITTING,** please read <https://github.com/vllm-project/vllm-omni/blob/main/CONTRIBUTING.md>
 (anything written below this line will be removed by GitHub Actions)

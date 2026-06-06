@@ -22,10 +22,9 @@ Default to quick if unsure. Run full before marking a PR "ready for review."
 
 ```bash
 BASE=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null)
+BASE=${BASE:-main}
 git diff --name-only ${BASE}...HEAD
 ```
-
-If no base is found, use `main`.
 
 ### Step 2: Validate PR Title
 

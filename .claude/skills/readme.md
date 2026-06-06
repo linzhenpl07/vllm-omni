@@ -26,8 +26,8 @@ include:
   format, catches dead code, verifies accuracy/perf claims, and confirms merge
   readiness
 - `review-pr`: provides a structured workflow for reviewing pull requests
-- `vllm-omni-npu-upgrade`: upgrades NPU model runners to align with the latest
-  vllm-ascend NPUModelRunner
+- `vllm-omni-npu-model-runner-upgrade`: upgrades NPU model runners to align with the
+  latest vllm-ascend NPUModelRunner
 
 ## Maintenance Guidelines
 

@@ -1474,8 +1474,14 @@ class Cosmos3VFMTransformer(nn.Module):
             hidden_parts.append(hidden_sound)
         hidden_gen = torch.cat(hidden_parts, dim=1)
 
-        # Run UND pathway once and cache K/V (replicated across all ranks)
-        if self.cached_kv is None:
+        # Run UND pathway once and cache K/V (replicated across all ranks).
+        # freqs_gen (M-RoPE cos/sin, derived purely from shape/fps) is recomputed
+        # whenever it is absent, so the session-memory path (RFC #4480) can store
+        # only the UND K/V and let the transformer recompute freqs each forward
+        # without re-running the language model. The bespoke path sets cached_kv
+        # and cached_freqs_gen together, so this stays byte-identical there.
+        need_kv = self.cached_kv is None
+        if need_kv or self.cached_freqs_gen is None:
             freqs_und, freqs_gen = self._compute_rope_freqs(
                 text_mask,
                 t,
@@ -1489,12 +1495,13 @@ class Cosmos3VFMTransformer(nn.Module):
                 action_fps=action_fps,
                 t_sound=s_sound,
             )
-            cached_kv_full = self.language_model(text_ids, freqs_und)
             self.cached_freqs_gen = freqs_gen
 
-            # Trim to real text length (remove padding).  K/V stay replicated;
-            # the framework Attention layer head-slices them via joint_key/value.
-            self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
+            if need_kv:
+                cached_kv_full = self.language_model(text_ids, freqs_und)
+                # Trim to real text length (remove padding).  K/V stay replicated;
+                # the framework Attention layer head-slices them via joint_key/value.
+                self.cached_kv = [(k[:, :max_real_len], v[:, :max_real_len]) for k, v in cached_kv_full]
 
         # Run GEN layers.  UND K/V (replicated) is passed to each layer;
         # the Cosmos3CrossAttention forwards them as joint_key/value so the

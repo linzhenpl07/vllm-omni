@@ -53,7 +53,9 @@ from vllm_omni.diffusion.distributed.parallel_state import (
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.memory import SessionMemoryManager, resolve_session_memory_config
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.cosmos3.state_cosmos3_adapter import Cosmos3StateAdapter
 from vllm_omni.diffusion.models.interface import (
     ReferenceVideoDecodeSpec,
     SupportImageInput,
@@ -771,6 +773,23 @@ class Cosmos3OmniDiffusersPipeline(
             sound_dim=sound_dim,
             sound_latent_fps=sound_latent_fps,
         )
+
+        # Opt-in: route the per-CFG-branch UND text K/V through the shared
+        # SessionMemoryManager (RFC #4480) instead of the transformer-instance
+        # cache, which has no session keying and lets concurrent requests clobber
+        # each other. Default off -> the bespoke transformer-instance path below
+        # is byte-identical to before.
+        self._use_session_memory, mm_max_sessions = resolve_session_memory_config(
+            enable=od_config.enable_session_memory_manager,
+        )
+        self._memory_manager: SessionMemoryManager | None = (
+            SessionMemoryManager(max_sessions=mm_max_sessions) if self._use_session_memory else None
+        )
+        # Set per-forward by the runner when the BDE paged path is active (Stage C/D);
+        # None means the dense session-adapter path (Stage B) or the bespoke path.
+        self._bde_kv_state = None
+        if self._use_session_memory:
+            logger.info("Cosmos3: session memory manager enabled (max_sessions=%d)", mm_max_sessions)
 
         # --- Scheduler ---
         # Load from checkpoint to preserve solver_order, timestep_spacing,
@@ -2173,6 +2192,48 @@ class Cosmos3OmniDiffusersPipeline(
         action_velocity_mask = 1.0 - condition_mask
         return action_latents, action_velocity_mask, clean_action, raw_action_dim
 
+    # -- Session-memory bypass for UND text K/V (RFC #4480) -----------------
+    # Mirrors DreamZero's `_kv_*` pattern: route through the BDE pool when set
+    # (Stage C/D), else the session adapter (Stage B), else the bespoke
+    # transformer-instance cache. All gated so the default path is unchanged.
+
+    def _get_or_create_cosmos3_state(self, session_id: str | None) -> Cosmos3StateAdapter | None:
+        # getattr guard so lightweight `__new__` test fixtures (no _memory_manager) work.
+        if getattr(self, "_memory_manager", None) is None:
+            return None
+        return Cosmos3StateAdapter(session_id, self._memory_manager)
+
+    def _kv_load_und(self, state: Cosmos3StateAdapter | None, is_negative: bool) -> bool:
+        """Load this branch's UND K/V onto the transformer before forward.
+
+        Returns True if the session/BDE path handled the load (caller skips the
+        bespoke ``cond_cache`` assignment), False for the bespoke path. ``freqs_gen``
+        is reset to None so the transformer recomputes it (it is not stored).
+        """
+        if getattr(self, "_bde_kv_state", None) is not None:
+            raise NotImplementedError("BDE pool path for Cosmos3 UND K/V is Stage C/D")
+        if state is not None:
+            state.load_into_transformer(self.transformer, is_negative)  # sets cached_kv (None if first)
+            self.transformer.cached_freqs_gen = None
+            return True
+        return False
+
+    def _kv_capture_und(self, state: Cosmos3StateAdapter | None, is_negative: bool) -> None:
+        """After forward, store the freshly computed UND K/V for this branch (encode-once)."""
+        if getattr(self, "_bde_kv_state", None) is not None:
+            raise NotImplementedError("BDE pool path for Cosmos3 UND K/V is Stage C/D")
+        if state is not None:
+            state.capture_from_transformer(self.transformer, is_negative)
+
+    def _kv_reset_und(self, state: Cosmos3StateAdapter | None) -> None:
+        """Reset the per-session UND branches (replaces ``transformer.reset_cache()``)."""
+        if getattr(self, "_bde_kv_state", None) is not None:
+            raise NotImplementedError("BDE pool path for Cosmos3 UND K/V is Stage C/D")
+        if state is not None:
+            state.reset()
+        else:
+            self.transformer.reset_cache()
+
     # -- Denoising loop (shared by T2V and I2V) -----------------------------
 
     def diffuse(
@@ -2196,6 +2257,7 @@ class Cosmos3OmniDiffusersPipeline(
         guidance_interval: tuple[float, float] | None = None,
         raw_action_dim: int | None = None,
         scheduler: Any | None = None,
+        session_id: str | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Denoising loop with 3-mode CFG support (parallel, sequential, none).
 
@@ -2227,7 +2289,9 @@ class Cosmos3OmniDiffusersPipeline(
         do_cfg = guidance_scale > 1.0
         cfg_parallel = self._cfg_parallel_active() and do_cfg
         step_scheduler = scheduler if scheduler is not None else self.scheduler
-        self.transformer.reset_cache()
+        # Session-keyed UND K/V (RFC #4480); None => bespoke transformer-instance cache.
+        kv_state = self._get_or_create_cosmos3_state(session_id)
+        self._kv_reset_und(kv_state)
 
         def _cfg_active_at(t: torch.Tensor) -> bool:
             if guidance_interval is None:
@@ -2394,7 +2458,8 @@ class Cosmos3OmniDiffusersPipeline(
                 timestep = t.unsqueeze(0)
                 cfg_active = _cfg_active_at(t)
 
-                self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
+                if not self._kv_load_und(kv_state, is_negative=False):
+                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = cond_cache
                 noise_cond = self.transformer(
                     hidden_states=latents,
                     timestep=timestep,
@@ -2404,11 +2469,14 @@ class Cosmos3OmniDiffusersPipeline(
                     sound_latents=sound_latents,
                     **shared_kwargs,
                 )
-                if cond_cache[0] is None:
+                if kv_state is not None:
+                    self._kv_capture_und(kv_state, is_negative=False)
+                elif cond_cache[0] is None:
                     cond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
 
                 if cfg_active or keep_uncond_for_cache:
-                    self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
+                    if not self._kv_load_und(kv_state, is_negative=True):
+                        self.transformer.cached_kv, self.transformer.cached_freqs_gen = uncond_cache
                     noise_uncond = self.transformer(
                         hidden_states=latents,
                         timestep=timestep,
@@ -2418,7 +2486,9 @@ class Cosmos3OmniDiffusersPipeline(
                         sound_latents=sound_latents,
                         **shared_kwargs,
                     )
-                    if uncond_cache[0] is None:
+                    if kv_state is not None:
+                        self._kv_capture_und(kv_state, is_negative=True)
+                    elif uncond_cache[0] is None:
                         uncond_cache = (self.transformer.cached_kv, self.transformer.cached_freqs_gen)
                     # Outside the interval, scale=1.0 makes the combined result
                     # equal to noise_cond; the uncond pass is computed only to
@@ -3234,6 +3304,7 @@ class Cosmos3OmniDiffusersPipeline(
                 guidance_interval=guidance_interval,
                 raw_action_dim=raw_action_dim,
                 scheduler=scheduler,
+                session_id=getattr(req, "request_id", None),
             )
 
         if is_t2i and batch_size > 1:

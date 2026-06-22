@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from vllm_omni.diffusion.memory import SessionMemoryManager
+
 from vllm_omni.diffusion.models.cosmos3.state_cosmos3_adapter import Cosmos3StateAdapter
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -24,14 +24,13 @@ SEQ, DIM = 3, 4
 def _fake_cached_kv(seed: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """A list of per-layer (K, V); contents seeded so branches/sessions differ."""
     g = torch.Generator().manual_seed(seed)
-    return [
-        (torch.randn(1, SEQ, DIM, generator=g), torch.randn(1, SEQ, DIM, generator=g))
-        for _ in range(LAYERS)
-    ]
+    return [(torch.randn(1, SEQ, DIM, generator=g), torch.randn(1, SEQ, DIM, generator=g)) for _ in range(LAYERS)]
 
 
 def _adapter(session_id: str, manager: SessionMemoryManager | None = None) -> Cosmos3StateAdapter:
-    return Cosmos3StateAdapter(session_id, manager or SessionMemoryManager())
+    # `manager is not None`, not `manager or ...`: an empty SessionMemoryManager is
+    # falsy (it defines __len__), so `or` would silently swap in a fresh manager.
+    return Cosmos3StateAdapter(session_id, manager if manager is not None else SessionMemoryManager())
 
 
 def _assert_kv_equal(got: list | None, expected: list) -> None:
@@ -46,6 +45,7 @@ class _FakeTransformer:
 
 
 # ----------------------------- equivalence -----------------------------
+
 
 def test_branch_starts_uninitialized() -> None:
     a = _adapter("s0")
@@ -110,6 +110,7 @@ def test_set_does_not_alias_source_after_dict_wrap() -> None:
 
 # ----------------------------- reset -----------------------------
 
+
 def test_reset_clears_both_branches() -> None:
     a = _adapter("s0")
     a.set_branch_kv(False, _fake_cached_kv(1))
@@ -121,6 +122,7 @@ def test_reset_clears_both_branches() -> None:
 
 
 # ----------------------- concurrency isolation (core) -----------------------
+
 
 def test_two_sessions_do_not_clobber() -> None:
     manager = SessionMemoryManager()

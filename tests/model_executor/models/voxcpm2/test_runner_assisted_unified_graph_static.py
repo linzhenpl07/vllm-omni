@@ -11,6 +11,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[4]
 RUNNER = REPO_ROOT / "vllm_omni" / "worker" / "gpu_ar_model_runner.py"
 TALKER = REPO_ROOT / "vllm_omni" / "model_executor" / "models" / "voxcpm2" / "voxcpm2_talker.py"
+DEPLOY = REPO_ROOT / "vllm_omni" / "deploy" / "voxcpm2.yaml"
 
 
 def test_ar_runner_exposes_runner_assisted_full_metadata_hook():
@@ -62,16 +63,7 @@ def test_voxcpm2_graph_paths_fail_closed_and_preserve_deterministic_noise():
 
     assert "self._enable_unified_decode_graph=(use_cuda_graph" in compact_source
     assert "andnotself._deterministic_cfm_noise" in compact_source
-    assert "self._enable_decode_tail_graph=(use_cuda_graph" in compact_source
-
-    parse_tail_source = source[source.index("def _parse_decode_tail_graph_pre_capture_sizes") :]
-    parse_tail_source = parse_tail_source[: parse_tail_source.index("def _capture_vae_graph")]
-    assert "_unified_graph_bucket_sizes" not in parse_tail_source
-
-    tail_source = source[source.index("def _forward_decode_tail_graph") :]
-    tail_source = tail_source[: tail_source.index("def _forward_decode_tail_graph_fallback")]
-    assert "except Exception:" in tail_source
-    assert "_forward_decode_tail_graph_fallback(req_metas, batch_out)" in tail_source
+    assert "decode_tail_graph" not in source
 
     unified_source = source[source.index("def _forward_unified_decode") :]
     unified_source = unified_source[: unified_source.index("# -------------------- vllm hooks")]
@@ -103,8 +95,20 @@ def test_voxcpm2_batch_unified_graph_requires_runner_metadata_marker():
     assert "graph_size = self._select_unified_graph_bucket_size(num_reqs)" in forward_source
     assert "self._unified_graphs[graph_size]" in forward_source
     assert "g.input_embeds[num_reqs:graph_size].zero_()" in forward_source
+    assert "ifnum_reqs>1andnotself._runner_assisted_unified_decode_graph_active" in compact_source
     assert "andnotcfg.enable_runner_assisted_unified_decode_graph" not in compact_source
     needs_source = source[source.index("def get_runner_assisted_full_attention_metadata_request") :]
     needs_source = needs_source[: needs_source.index("def set_runner_assisted_full_attention_metadata_context")]
     assert "_select_unified_graph_bucket_size(num_reqs)" in needs_source
     assert "_should_use_decode_graph(num_reqs)" not in needs_source
+
+
+def test_voxcpm2_deploy_defaults_to_full_unified_graph_only():
+    source = DEPLOY.read_text()
+
+    assert "max_num_seqs: 8" in source
+    assert "enable_unified_decode_graph: true" in source
+    assert "unified_decode_graph_max_batch_size: 8" in source
+    assert "unified_decode_graph_pre_capture_sizes: 1,2,4,8" in source
+    assert "enable_runner_assisted_unified_decode_graph: true" in source
+    assert "allow_unified_decode_graph_batch_attention: true" in source

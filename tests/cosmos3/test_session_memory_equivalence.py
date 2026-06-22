@@ -31,7 +31,9 @@ def _fake_cached_kv(seed: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
 
 
 def _adapter(session_id: str, manager: SessionMemoryManager | None = None) -> Cosmos3StateAdapter:
-    return Cosmos3StateAdapter(session_id, manager or SessionMemoryManager())
+    # `manager is not None`, not `manager or ...`: an empty SessionMemoryManager is
+    # falsy (it defines __len__), so `or` would silently swap in a fresh manager.
+    return Cosmos3StateAdapter(session_id, manager if manager is not None else SessionMemoryManager())
 
 
 def _assert_kv_equal(got: list | None, expected: list) -> None:

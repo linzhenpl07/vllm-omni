@@ -38,6 +38,19 @@ syntax (`py_compile`) and standalone adapter logic were checked. The following
    host-side delta. If significant, the documented fallback is a per-generation
    transient (still not stored in session memory).
 
+## All 3 CFG paths are wired — verify each
+
+`diffuse()` has three branches; session keying is now wired in all three (commit
+e814d9c1). Verify bit-equivalence (flag on vs off) **for each**:
+- **cfg-parallel** (`cfg_world_size > 1`, multi-GPU): each rank runs one branch
+  (rank 0 cond / else uncond); load/capture that rank's branch. Needs ≥2 GPUs to
+  exercise; check no cross-rank/branch mixing.
+- **sequential CFG** (single GPU, `guidance_scale > 1`): the main Stage B path.
+- **no-CFG** (`guidance_scale <= 1`): single cond branch.
+- Also verify: with flag ON, no stale UND K/V leaks across two back-to-back
+  generations in the cfg-parallel / no-CFG paths (the bug e814d9c1 fixed) —
+  run gen A then gen B with different prompts, B must not inherit A's cache.
+
 ## Known stubs (Stage C/D, not this PR)
 
 - `_kv_*` raise `NotImplementedError` when `self._bde_kv_state` is set (the BDE

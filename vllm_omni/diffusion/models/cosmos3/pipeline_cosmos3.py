@@ -50,6 +50,7 @@ from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import DistributedAutoencoderKLWan
 from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.parallel_state import (
+    get_classifier_free_guidance_rank,
     get_classifier_free_guidance_world_size,
 )
 from vllm_omni.diffusion.distributed.utils import get_local_device
@@ -2226,13 +2227,17 @@ class Cosmos3OmniDiffusersPipeline(
             state.capture_from_transformer(self.transformer, is_negative)
 
     def _kv_reset_und(self, state: Cosmos3StateAdapter | None) -> None:
-        """Reset the per-session UND branches (replaces ``transformer.reset_cache()``)."""
+        """Reset UND K/V at the start of a generation (replaces ``transformer.reset_cache()``).
+
+        Always clears the transformer-instance cache so no stale UND K/V leaks into
+        paths that read it directly (cfg-parallel / no-CFG / bespoke fallback); also
+        clears the session objects when session memory is active.
+        """
         if getattr(self, "_bde_kv_state", None) is not None:
             raise NotImplementedError("BDE pool path for Cosmos3 UND K/V is Stage C/D")
+        self.transformer.reset_cache()
         if state is not None:
             state.reset()
-        else:
-            self.transformer.reset_cache()
 
     # -- Denoising loop (shared by T2V and I2V) -----------------------------
 
@@ -2416,6 +2421,9 @@ class Cosmos3OmniDiffusersPipeline(
                 sound_latents = step_out[idx]
 
         if cfg_parallel:
+            # Each CFG-parallel rank runs exactly one branch (rank 0 -> cond,
+            # else uncond), so session keying loads/stores only this rank's branch.
+            cfg_rank_is_negative = get_classifier_free_guidance_rank() != 0
             for t in self.progress_bar(timesteps):
                 timestep = t.unsqueeze(0)
                 # Out-of-interval steps run with effective scale 1.0 so the
@@ -2423,6 +2431,7 @@ class Cosmos3OmniDiffusersPipeline(
                 # All ranks still execute both branches; no CFG-Parallel
                 # divergence.
                 step_scale = guidance_scale if _cfg_active_at(t) else 1.0
+                self._kv_load_und(kv_state, is_negative=cfg_rank_is_negative)
                 noise_pred = self.predict_noise_maybe_with_cfg(
                     do_true_cfg=True,
                     true_cfg_scale=step_scale,
@@ -2446,6 +2455,8 @@ class Cosmos3OmniDiffusersPipeline(
                     ),
                     cfg_normalize=False,
                 )
+                if kv_state is not None:
+                    self._kv_capture_und(kv_state, is_negative=cfg_rank_is_negative)
                 _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
 
         elif do_cfg:
@@ -2501,8 +2512,11 @@ class Cosmos3OmniDiffusersPipeline(
                 _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
 
         else:
+            # No CFG: a single cond branch per step. Bespoke (state None) keeps
+            # using the transformer-instance cache exactly as before.
             for t in self.progress_bar(timesteps):
                 timestep = t.unsqueeze(0)
+                self._kv_load_und(kv_state, is_negative=False)
                 noise_pred = self.transformer(
                     hidden_states=latents,
                     timestep=timestep,
@@ -2512,6 +2526,8 @@ class Cosmos3OmniDiffusersPipeline(
                     sound_latents=sound_latents,
                     **shared_kwargs,
                 )
+                if kv_state is not None:
+                    self._kv_capture_und(kv_state, is_negative=False)
                 _assign_step_out(_step(noise_pred, t, latents, action_latents, sound_latents))
 
         outputs = [latents]

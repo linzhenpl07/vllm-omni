@@ -15,7 +15,7 @@ from vllm.model_executor.layers.quantization.base_config import QuantizationConf
 
 from vllm_omni.diffusion.distributed.sp_plan import SequenceParallelInput
 from vllm_omni.diffusion.distributed.sp_sharding import sp_shard
-from vllm_omni.diffusion.forward_context import get_forward_context
+from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     Transformer2DModelOutput,
     WanTransformer3DModel,
@@ -143,6 +143,26 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
 
+        # P1 (RFC #4710): VACE reference-hint cache (lossy, opt-in). None = disabled.
+        self._vace_hint_cache = None
+
+    def enable_vace_hint_cache(self, refresh_interval: int = 2) -> None:
+        """Enable P1 (RFC #4710): cache the VACE reference hints and reuse them on
+        non-refresh steps. Lossy / opt-in. ``refresh_interval`` = recompute every K steps
+        (a large value caches once at the first step and reuses for the rest)."""
+        from vllm_omni.diffusion.cache.vace_hint_cache import VaceHintCacheState
+
+        self._vace_hint_cache = VaceHintCacheState(refresh_interval)
+
+    def reset_vace_hint_cache(self) -> None:
+        """Clear cached hints; call at the start of each generation/request."""
+        if self._vace_hint_cache is not None:
+            self._vace_hint_cache.reset()
+
+    def disable_vace_hint_cache(self) -> None:
+        """Turn P1 off (back to always recomputing the hints)."""
+        self._vace_hint_cache = None
+
     def embed_vace_context(
         self,
         vace_context: torch.Tensor,
@@ -249,22 +269,37 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
                 sp_size,
             )
 
-        # VACE: embed context and run conditioning blocks
+        # VACE: embed context and run conditioning blocks.
+        # P1 (RFC #4710): optionally reuse the hints computed at an earlier denoising step
+        # (lossy, opt-in via enable_vace_hint_cache). Disabled -> identical to the original.
         vace_hints = None
         if vace_context is not None and self.vace_blocks is not None:
-            full_seq_len = hidden_states.shape[1] * sp_size
-            control_hidden_states = self.embed_vace_context(vace_context.to(hidden_states.dtype), full_seq_len, sp_size)
-            vace_hints = []
-            for i, block in enumerate(self.vace_blocks):
-                conditioning_states, control_hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    control_hidden_states,
-                    timestep_proj,
-                    rotary_emb,
-                    hidden_states_mask,
+            hint_cache = self._vace_hint_cache
+            branch, should_refresh = None, True
+            if hint_cache is not None:
+                step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
+                branch, should_refresh = hint_cache.begin_call(step_idx)
+            if hint_cache is not None and not should_refresh:
+                # reuse: skip the vace_blocks recompute entirely
+                vace_hints = hint_cache.get(branch)
+            else:
+                full_seq_len = hidden_states.shape[1] * sp_size
+                control_hidden_states = self.embed_vace_context(
+                    vace_context.to(hidden_states.dtype), full_seq_len, sp_size
                 )
-                vace_hints.append(conditioning_states)
+                vace_hints = []
+                for i, block in enumerate(self.vace_blocks):
+                    conditioning_states, control_hidden_states = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        control_hidden_states,
+                        timestep_proj,
+                        rotary_emb,
+                        hidden_states_mask,
+                    )
+                    vace_hints.append(conditioning_states)
+                if hint_cache is not None:
+                    hint_cache.store(branch, vace_hints)
 
         # Normalize scale to per-layer list
         if vace_hints is not None and isinstance(vace_context_scale, (int, float)):

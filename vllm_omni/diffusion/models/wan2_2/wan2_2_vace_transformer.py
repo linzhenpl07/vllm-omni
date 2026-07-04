@@ -143,25 +143,47 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
         self._cached_rope_emb = None
         self._cached_rope_resolution = None
 
-        # P1 (RFC #4710): VACE reference-hint cache (lossy, opt-in). None = disabled.
-        self._vace_hint_cache = None
+        # P1 (RFC #4710): reference-hint cache (lossy, opt-in). None = disabled.
+        # These enable/reset/disable methods are the model-provided contract the generic
+        # RefHintCacheBackend drives (see cache/ref_hint_cache/backend.py).
+        self._ref_hint_cache = None
 
-    def enable_vace_hint_cache(self, refresh_interval: int = 2) -> None:
+    def enable_ref_hint_cache(self, refresh_interval: int = 2) -> None:
         """Enable P1 (RFC #4710): cache the VACE reference hints and reuse them on
         non-refresh steps. Lossy / opt-in. ``refresh_interval`` = recompute every K steps
         (a large value caches once at the first step and reuses for the rest)."""
-        from vllm_omni.diffusion.cache.vace_hint_cache import VaceHintCacheState
+        from vllm_omni.diffusion.cache.ref_hint_cache import RefHintCacheState
 
-        self._vace_hint_cache = VaceHintCacheState(refresh_interval)
+        self._ref_hint_cache = RefHintCacheState(refresh_interval)
 
-    def reset_vace_hint_cache(self) -> None:
+    def reset_ref_hint_cache(self) -> None:
         """Clear cached hints; call at the start of each generation/request."""
-        if self._vace_hint_cache is not None:
-            self._vace_hint_cache.reset()
+        if self._ref_hint_cache is not None:
+            self._ref_hint_cache.reset()
 
-    def disable_vace_hint_cache(self) -> None:
+    def disable_ref_hint_cache(self) -> None:
         """Turn P1 off (back to always recomputing the hints)."""
-        self._vace_hint_cache = None
+        self._ref_hint_cache = None
+
+    def _ref_hint_begin_call(self):
+        """P1 hot-path helper: consult the reference-hint cache for this forward.
+
+        INVARIANT: the transformer forward is called exactly once per (denoising step, CFG
+        branch), and the branches within a step are visited in a fixed order. The cache
+        derives ``branch`` from the call index within a step (see RefHintCacheState), so any
+        change to the forward scheduling — batched vs sequential CFG, extra forwards per
+        step, reordering cond/uncond — MUST be reflected in the cache contract or isolation
+        across CFG branches breaks. ``denoise_step_idx is None`` (warmup / no forward
+        context) always refreshes, so the cache is a safe no-op.
+
+        Returns ``(branch, should_refresh)``; ``should_refresh=True`` (branch possibly None)
+        means recompute the hints this step.
+        """
+        cache = self._ref_hint_cache
+        if cache is None:
+            return None, True
+        step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
+        return cache.begin_call(step_idx)
 
     def embed_vace_context(
         self,
@@ -271,14 +293,12 @@ class WanVACETransformer3DModel(WanTransformer3DModel):
 
         # VACE: embed context and run conditioning blocks.
         # P1 (RFC #4710): optionally reuse the hints computed at an earlier denoising step
-        # (lossy, opt-in via enable_vace_hint_cache). Disabled -> identical to the original.
+        # (lossy, opt-in via enable_ref_hint_cache). Disabled -> identical to the original.
+        # The reuse decision (and its branch/step INVARIANT) lives in _ref_hint_begin_call.
         vace_hints = None
         if vace_context is not None and self.vace_blocks is not None:
-            hint_cache = self._vace_hint_cache
-            branch, should_refresh = None, True
-            if hint_cache is not None:
-                step_idx = get_forward_context().denoise_step_idx if is_forward_context_available() else None
-                branch, should_refresh = hint_cache.begin_call(step_idx)
+            hint_cache = self._ref_hint_cache
+            branch, should_refresh = self._ref_hint_begin_call()
             if hint_cache is not None and not should_refresh:
                 # reuse: skip the vace_blocks recompute entirely
                 vace_hints = hint_cache.get(branch)

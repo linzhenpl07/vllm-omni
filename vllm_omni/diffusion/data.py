@@ -409,11 +409,11 @@ class DiffusionCacheConfig:
     # Default: False calibration mode (computes mag_ratios on first run)
     mag_calibrate: bool = False
 
-    # VACE hint cache parameters [vace_hint only] (RFC #4710, P1 — lossy, opt-in)
-    # Recompute the VACE reference hints every K denoising steps and reuse them in between
+    # Reference-hint cache parameters [ref_hint only] (RFC #4710, P1 — lossy, opt-in)
+    # Recompute the reference hints every K denoising steps and reuse them in between
     # (large K -> compute once at the first step and reuse for the rest). Only applies to
-    # reference-conditioned models with a hint branch (e.g. Wan-VACE).
-    vace_hint_refresh_interval: int = 2
+    # reference-conditioned models implementing the hint contract (e.g. Wan-VACE).
+    ref_hint_refresh_interval: int = 2
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)

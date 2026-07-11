@@ -13,10 +13,11 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      # Wan2.2 TI2V-5B is served by the base Wan22Pipeline, which auto-detects
-      # expand_timesteps (TI2V-5B mode) from model_index.json. (The standalone
-      # Wan22TI2VPipeline was consolidated into Wan22Pipeline upstream.)
-      model_class_name: Wan22Pipeline
+      # Wan2.2 TI2V-5B is served by the base Wan22Pipeline class, registered
+      # under the `WanPipeline` key, which auto-detects expand_timesteps
+      # (TI2V-5B mode) from model_index.json. (`model_class_name` is the
+      # diffusion-registry key, not the class name.)
+      model_class_name: WanPipeline
       max_num_seqs: 1
       enforce_eager: true
       trust_remote_code: true

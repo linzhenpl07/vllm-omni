@@ -69,6 +69,7 @@ nav:
         - Sequence Parallel: user_guide/diffusion/parallelism/sequence_parallel.md
         - Tensor Parallel: user_guide/diffusion/parallelism/tensor_parallel.md
         - VAE Parallelism: user_guide/diffusion/parallelism/vae_parallelism.md
+        - Replica Data Parallel: user_guide/diffusion/parallelism/replica_data_parallel.md
       - CPU Offloading: user_guide/diffusion/cpu_offload_diffusion.md
       - LoRA: user_guide/diffusion/lora.md
       - Custom Pipeline: features/custom_pipeline.md

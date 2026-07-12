@@ -112,10 +112,11 @@ The length of `devices` must match one of two shapes when `num_replicas > 1`:
   `{0,1}, {2,3}, {4,5}, {6,7}`.
 
 !!! info
-    In single-runtime `vllm serve`, replica fan-out is driven by the config's
-    `runtime.num_replicas`, **not** the `--omni-num-replica` CLI flag (which applies to
-    the headless / multi-runtime launch path). If only one replica loads, check
-    `runtime.num_replicas` in the stage config first.
+    In single-runtime `vllm serve`, replica fan-out is driven **only** by the config's
+    `runtime.num_replicas` — there is no CLI replica flag for this path. (The headless /
+    multi-runtime launch path uses `--omni-dp-size-local`, which is process-local and
+    requires `--stage-id`.) If only one replica loads, check `runtime.num_replicas` in
+    the stage config first.
 
 ---
 
@@ -172,8 +173,10 @@ fits the model to maximize the replica count (and thus throughput).
 
 **Solutions**:
 
-1. Set `runtime.num_replicas` in the **stage config** — in single-runtime `serve`, the
-   `--omni-num-replica` CLI flag does not fan out replicas.
+1. Set `runtime.num_replicas` in the **stage config** — in single-runtime `serve` this
+   is the only knob that fans out replicas (there is no CLI flag for it; the
+   `--omni-dp-size-local` flag applies to the headless / multi-runtime path and requires
+   `--stage-id`).
 2. Ensure `runtime.devices` enumerates the full pool (pool mode) or a valid per-replica
    template (template mode) — see [Configuration Parameters](#configuration-parameters).
 3. Replicas warm up sequentially: replica 0 is ready first and the rest a few seconds
@@ -194,7 +197,7 @@ mode) or `tensor_parallel_size` (template mode). Any other length is rejected.
    scale request throughput near-linearly.
 2. ✅ **Size `devices`** — `num_replicas * tensor_parallel_size` entries (pool mode) or
    `tensor_parallel_size` (template mode).
-3. ✅ **Use the config, not the CLI** — in single-runtime `serve`, fan-out comes from
-   `runtime.num_replicas`, not `--omni-num-replica`.
+3. ✅ **Use the config** — in single-runtime `serve`, fan-out comes from
+   `runtime.num_replicas` (the headless / multi-runtime path uses `--omni-dp-size-local`).
 4. ✅ **Compose for both axes** — replica-DP across replicas + an intra-request axis
    inside each replica scales throughput and latency together.

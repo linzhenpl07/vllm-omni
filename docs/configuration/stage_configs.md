@@ -378,8 +378,9 @@ Number of independent engine replicas to run for this stage (replica data parall
 Requests are load-balanced across the replicas, scaling request throughput near-linearly.
 When `> 1`, `devices` must enumerate the replica pool: either
 `num_replicas * tensor_parallel_size` entries (pool mode) or `tensor_parallel_size`
-entries (a per-replica template). In single-runtime `serve`, this config field — not the
-`--omni-num-replica` CLI flag — drives replica fan-out. See the
+entries (a per-replica template). In single-runtime `serve`, this config field is what
+drives replica fan-out (the headless / multi-runtime launch path instead uses the
+process-local `--omni-dp-size-local` flag). See the
 [Replica Data Parallelism](../user_guide/diffusion/parallelism/replica_data_parallel.md)
 guide.
 

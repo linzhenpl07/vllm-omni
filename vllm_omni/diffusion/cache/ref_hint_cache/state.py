@@ -99,6 +99,6 @@ class RefHintCacheState:
 
     def store(self, branch: int | None, hints: Any) -> None:
         """Store freshly-computed hints for ``branch`` (no-op if branch is None)."""
-        self.misses += 1
         if branch is not None:
+            self.misses += 1
             self._cache[branch] = hints

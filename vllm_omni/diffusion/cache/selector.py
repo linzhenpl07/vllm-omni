@@ -22,7 +22,7 @@ def get_cache_backend(cache_backend: str | None, cache_config: Any) -> CacheBack
 
     Args:
         cache_backend: Cache backend name ("cache_dit", "tea_cache",
-            "mag_cache", "step_cache", or None).
+            "mag_cache", "step_cache", "ref_hint", or None).
         cache_config: Cache configuration (dict or DiffusionCacheConfig instance).
 
     Returns:

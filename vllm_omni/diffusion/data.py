@@ -414,6 +414,11 @@ class DiffusionCacheConfig:
     # (large K -> compute once at the first step and reuse for the rest). Only applies to
     # reference-conditioned models implementing the hint contract (e.g. Wan-VACE).
     ref_hint_refresh_interval: int = 2
+    # Reuse (ref_hint_refresh_interval >= 2) is lossy and can degrade output beyond RFC
+    # #4710's <=8% mean-DINOv2 guidance (measured ~20% DINOv2 drop at K=2), so it must be
+    # explicitly acknowledged. The backend refuses to enable a reusing interval unless this
+    # is True; ref_hint_refresh_interval=1 recomputes every step (lossless) and is exempt.
+    ref_hint_acknowledge_lossy: bool = False
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)

@@ -14,7 +14,7 @@ This example uses `Wan-AI/Wan2.2-TI2V-5B-Diffusers` with one GPU per replica.
 |------|---------|
 | `wan2_2_ti2v_dp.yaml` | Diffusion stage config; `runtime.num_replicas` + `runtime.devices` drive the fan-out. |
 | `run_server.sh` | Substitutes `NUM_REPLICAS` / `DEVICES` into the config and serves. |
-| `bench_replica_dp.py` | Replica-agnostic load driver; reports throughput, latency, and an md5 isolation check. |
+| `bench_replica_dp.py` | Replica-agnostic load driver; reports throughput, latency, and a per-input isolation check. |
 
 ## Run
 
@@ -39,16 +39,29 @@ python bench_replica_dp.py --url http://127.0.0.1:8098 \
 Re-run the server at `NUM_REPLICAS=1,2,4` (same client workload each time) and
 compare `videos/min`. Pass `--baseline-tpm <N=1 value>` to print a scaling factor.
 
-### Isolation check (optional)
+### Isolation check
 
-With a fixed `--seed`, outputs are deterministic, so a byte-identical result
-across replica counts confirms the replicas do not cross-talk:
+Identical outputs under a *shared* prompt+seed prove nothing -- every request
+would be identical regardless of isolation. Instead each request gets a distinct
+input (a prompt from the pool + a unique seed `base_seed+i`), and we check that a
+request's output is unchanged whether it runs alone or concurrently amid other
+distinct requests. Capture a per-input baseline on `N=1`, then verify it under
+`N>=2` concurrency:
 
 ```bash
-python bench_replica_dp.py --seed 42 --save-dir out_n1 ...   # against NUM_REPLICAS=1
-python bench_replica_dp.py --seed 42 --save-dir out_n4 ...   # against NUM_REPLICAS=4
-# md5 dedup should report "all identical" in each run, and the two runs should match
+# 1) against NUM_REPLICAS=1 (serial), record each input's output hash
+python bench_replica_dp.py --num-requests 8 --concurrency 1 \
+    --write-baseline baseline.json
+
+# 2) against NUM_REPLICAS>=2, replay the SAME inputs concurrently and verify
+python bench_replica_dp.py --num-requests 8 --concurrency 8 \
+    --check-baseline baseline.json
 ```
+
+Step 2 exits non-zero if any request's output differs from its own baseline (a
+mismatch means cross-request state bleed or misrouting). Keep `--num-requests`,
+`--base-seed`, and the prompt source identical between the two runs so the input
+sets match.
 
 ## Measured scaling
 
@@ -60,8 +73,9 @@ Wan2.2-TI2V-5B (832×480, 33 frames, 30 steps), 4× A800-80GB (NVLink), one GPU 
 | 2 | 9.20 | 1.95× | 98% |
 | 4 | 18.02 | 3.83× | 96% |
 
-Per-request latency stayed flat (~13–14 s) across all replica counts, and
-seed-fixed outputs were byte-identical regardless of `N`.
+Per-request latency stayed flat (~13–14 s) across all replica counts. Isolation
+is checked per-input via the baseline/verify protocol above: each request's
+output under `N>=2` concurrency must match its own single-replica baseline.
 
 ## Notes on the config surface
 

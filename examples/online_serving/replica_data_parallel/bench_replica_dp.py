@@ -211,19 +211,27 @@ def main():
         print(f"baseline: wrote {len(got)} per-input hashes -> {args.write_baseline}")
     elif args.check_baseline:
         baseline = json.loads(Path(args.check_baseline).read_text())
-        matched = mismatched = missing = 0
+        matched = mismatched = unknown = 0
         for key, md5 in got.items():
             if key not in baseline:
-                missing += 1
-                print(f"  isolation: NO BASELINE for input {key!r} (run counts/inputs must match)")
+                unknown += 1
+                print(f"  isolation: NO BASELINE for input {key!r} (not in the baseline manifest)")
             elif baseline[key] == md5:
                 matched += 1
             else:
                 mismatched += 1
                 print(f"  isolation: MISMATCH for input {key!r} (output changed under concurrency)")
-        isolation_failed = mismatched > 0 or missing > 0
+        # PASS requires the run to cover the *whole* baseline: a subset (fewer requests, or
+        # some failed) must not pass just because the inputs it did run happened to match.
+        unverified = sorted(set(baseline) - set(got))
+        for key in unverified:
+            print(f"  isolation: NOT VERIFIED for baseline input {key!r} (absent from this run)")
+        isolation_failed = mismatched > 0 or unknown > 0 or len(unverified) > 0
         verdict = "PASS (isolated)" if not isolation_failed else "FAIL"
-        print(f"isolation: {matched} matched / {mismatched} mismatched / {missing} missing vs baseline -> {verdict}")
+        print(
+            f"isolation: {matched} matched / {mismatched} mismatched / {unknown} unknown / "
+            f"{len(unverified)} unverified vs baseline({len(baseline)}) -> {verdict}"
+        )
 
     if fail > 0 or ok == 0 or isolation_failed:
         sys.exit(1)

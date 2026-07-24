@@ -89,9 +89,7 @@ def pytorch_attn_forward(
     if k.shape[1] != q.shape[1]:
         num_heads, num_kv_heads = q.shape[1], k.shape[1]
         if num_heads % num_kv_heads != 0:
-            raise ValueError(
-                f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA/MQA."
-            )
+            raise ValueError(f"num_heads ({num_heads}) must be divisible by num_kv_heads ({num_kv_heads}) for GQA/MQA.")
         n_rep = num_heads // num_kv_heads
         k = k.repeat_interleave(n_rep, dim=1)
         v = v.repeat_interleave(n_rep, dim=1)

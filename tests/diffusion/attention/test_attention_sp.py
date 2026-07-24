@@ -45,6 +45,8 @@ from vllm_omni.diffusion.distributed.parallel_state import (
 from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.platforms import current_omni_platform
 
+pytestmark = [pytest.mark.core_model, pytest.mark.gpu]
+
 
 def update_environment_variables(envs_dict: dict[str, str]):
     """Update multiple environment variables with logging."""
@@ -161,8 +163,14 @@ class TestMultiLayerAttentionModel(torch.nn.Module):
         TestMultiLayerAttentionModel,
     ],
 )
-@pytest.mark.parametrize("ulysses_degree", [2])
-@pytest.mark.parametrize("ring_degree", [2])
+@pytest.mark.parametrize(
+    ("ulysses_degree", "ring_degree", "num_kv_heads"),
+    [
+        (2, 2, None),  # Existing hybrid Ulysses + Ring coverage.
+        (1, 2, 2),  # Pure Ring GQA: 8 query heads, 2 KV heads.
+        (1, 2, 1),  # Pure Ring MQA: 8 query heads, 1 KV head.
+    ],
+)
 @pytest.mark.parametrize("batch_size", [2])
 @pytest.mark.parametrize("seq_len", [16])
 @pytest.mark.parametrize("num_heads", [8])
@@ -185,8 +193,9 @@ def test_sequence_parallel(
     seq_len: int,
     num_heads: int,
     head_size: int,
+    num_kv_heads: int | None,
 ):
-    """Test Ulysses attention by comparing with and without SP enabled."""
+    """Compare Ulysses/Ring SP attention with a single-rank reference."""
     sequence_parallel_size = ulysses_degree * ring_degree
 
     # Skip if not enough GPUs available
@@ -216,6 +225,7 @@ def test_sequence_parallel(
                 seq_len,
                 num_heads,
                 head_size,
+                num_kv_heads,
                 dtype,
                 causal,
                 use_sync,
@@ -243,6 +253,7 @@ def test_sequence_parallel(
                 seq_len,
                 num_heads,
                 head_size,
+                num_kv_heads,
                 dtype,
                 causal,
                 use_sync,
@@ -338,6 +349,7 @@ def ulysses_attention_on_test_model(
     seq_len: int,
     num_heads: int,
     head_size: int,
+    num_kv_heads: int | None,
     dtype: torch.dtype,
     causal: bool,
     use_sync: bool,
@@ -415,7 +427,7 @@ def ulysses_attention_on_test_model(
             "head_size": head_size,
             "hidden_size": hidden_size,
             "causal": causal,
-            "num_kv_heads": None,
+            "num_kv_heads": num_kv_heads,
             "scatter_idx": 2,
             "gather_idx": 1,
             "use_sync": use_sync,

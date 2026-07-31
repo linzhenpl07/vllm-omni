@@ -133,6 +133,66 @@ class RefHintCacheBackend(CacheBackend):
             for previous_hint, current_hint in zip(previous, current)
         ]
 
+    @staticmethod
+    def _forecast_inplace_k2(
+        history: tuple[tuple[int, HintValue], ...],
+        step: int,
+    ) -> HintValue:
+        """Forecast into the oldest buffers for the K=2 schedule.
+
+        With K=2 there is exactly one forecast between refreshes. The oldest
+        fresh observation is dead immediately after that forecast, so its
+        storage can safely become the output. This removes both the full
+        forecast allocation and expression temporaries without adding another
+        approximation.
+        """
+        if len(history) != 2:
+            raise RuntimeError("forecast50 requires exactly two retained fresh hint observations")
+        (previous_step, previous), (current_step, current) = history
+        if len(previous) != len(current):
+            raise RuntimeError("reference-hint history changed shape between refreshes")
+        step_distance = max(current_step - previous_step, 1)
+        alpha = min(max((step - current_step) / step_distance, 0.0), _FORECAST_ALPHA_MAX)
+        correction = min(_FORECAST_GAIN * alpha, _FORECAST_CORRECTION_MAX)
+        for output_hint, current_hint in zip(previous, current):
+            # output = current + correction * (current - previous)
+            output_hint.mul_(-correction).add_(current_hint, alpha=1.0 + correction)
+        return previous
+
+    @staticmethod
+    def _to_pinned_cpu(hints: HintValue) -> HintValue:
+        """Copy a fresh GPU hint set to pinned CPU history."""
+        cpu_hints = []
+        for hint in hints:
+            cpu_hint = torch.empty_like(hint, device="cpu", pin_memory=True)
+            cpu_hint.copy_(hint)
+            cpu_hints.append(cpu_hint)
+        return cpu_hints
+
+    @staticmethod
+    def _forecast_from_cpu_k2(
+        history: tuple[tuple[int, HintValue], ...],
+        step: int,
+        device: torch.device,
+    ) -> HintValue:
+        """Forecast in pinned CPU memory and transfer only the result to GPU."""
+        if len(history) != 2:
+            raise RuntimeError("forecast50 requires exactly two retained fresh hint observations")
+        (previous_step, previous), (current_step, current) = history
+        if len(previous) != len(current):
+            raise RuntimeError("reference-hint history changed shape between refreshes")
+        step_distance = max(current_step - previous_step, 1)
+        alpha = min(max((step - current_step) / step_distance, 0.0), _FORECAST_ALPHA_MAX)
+        correction = min(_FORECAST_GAIN * alpha, _FORECAST_CORRECTION_MAX)
+
+        output = []
+        for previous_hint, current_hint in zip(previous, current):
+            cpu_output = torch.empty_like(current_hint, device="cpu", pin_memory=True)
+            cpu_output.copy_(current_hint)
+            cpu_output.mul_(1.0 + correction).add_(previous_hint, alpha=-correction)
+            output.append(cpu_output.to(device, non_blocking=True))
+        return output
+
     def enable(self, pipeline: object) -> None:
         self._check_lossy_ack()
         transformers = self._get_transformers(pipeline)
@@ -189,8 +249,18 @@ class RefHintCacheBackend(CacheBackend):
         state = self._state_for(owner)
         branch, should_refresh = state.begin_call(step)
         if should_refresh:
+            state.prepare_refresh(branch)
             value = compute()
-            state.store(branch, step, self._as_hints(value))
+            hints = self._as_hints(value)
+            stored_hints = hints
+            if (
+                hints
+                and hints[0].is_cuda
+                and self._strategy() == "forecast50"
+                and self._refresh_interval() == 2
+            ):
+                stored_hints = self._to_pinned_cpu(hints)
+            state.store(branch, step, stored_hints)
             return value
 
         assert branch is not None and step is not None
@@ -198,4 +268,10 @@ class RefHintCacheBackend(CacheBackend):
         strategy = self._strategy()
         if strategy == "reuse":
             return cast(T, history[-1][1])
+        if self._refresh_interval() == 2:
+            parameter = next(owner.parameters(), None)
+            current = history[-1][1]
+            if parameter is not None and parameter.is_cuda and current and not current[0].is_cuda:
+                return cast(T, self._forecast_from_cpu_k2(history, step, parameter.device))
+            return cast(T, self._forecast_inplace_k2(history, step))
         return cast(T, self._forecast(history, step))

@@ -161,6 +161,44 @@ def test_forecast50_uses_two_fresh_values_and_damped_prediction():
     assert torch.equal(forecast[0], torch.tensor([2.5]))
 
 
+def test_forecast50_k2_reuses_oldest_storage_and_evicts_before_refresh():
+    owner = _VaceLikeTransformer()
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=2,
+            ref_hint_strategy="forecast50",
+            ref_hint_acknowledge_lossy=True,
+        )
+    )
+    backend.enable(_FakePipeline(owner))
+    context = ForwardContext()
+    created = []
+
+    def compute():
+        value = [torch.tensor([float(len(created) * 2)])]
+        created.append(value)
+        return value
+
+    with override_forward_context(context):
+        context.denoise_step_idx = 0
+        backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+        context.denoise_step_idx = 1
+        backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+        oldest_ptr = created[0][0].data_ptr()
+
+        context.denoise_step_idx = 2
+        forecast = backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+        assert forecast[0].data_ptr() == oldest_ptr
+        assert torch.equal(forecast[0], torch.tensor([2.5]))
+
+        context.denoise_step_idx = 3
+        backend.execute(ModelRegion.REFERENCE_HINTS, owner, compute)
+
+    history = backend._states[id(owner)].history(0)
+    assert [step for step, _ in history] == [1, 3]
+    assert len(created) == 3
+
+
 def test_finish_request_releases_retained_hints():
     owner = _VaceLikeTransformer()
     pipeline = _FakePipeline(owner)

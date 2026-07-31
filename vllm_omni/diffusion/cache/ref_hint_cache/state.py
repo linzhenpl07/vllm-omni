@@ -79,6 +79,20 @@ class RefHintCacheState(Generic[ValueT]):
         self.hits += 1
         return tuple(self._history[branch])
 
+    def prepare_refresh(self, branch: int | None) -> None:
+        """Release history that cannot participate in the next forecast.
+
+        Once a refresh has been scheduled, only the latest fresh observation
+        is needed: it will be paired with the value about to be computed.
+        Dropping the older observation before compute avoids retaining three
+        complete values at the refresh-time memory peak.
+        """
+        if branch is None or self.strategy != _FORECAST50:
+            return
+        history = self._history.get(branch)
+        if history is not None and len(history) > 1:
+            del history[:-1]
+
     def store(self, branch: int | None, step: int | None, value: ValueT) -> None:
         """Retain a fresh value; unknown branch/step calls are deliberate no-ops."""
         if branch is None or step is None:

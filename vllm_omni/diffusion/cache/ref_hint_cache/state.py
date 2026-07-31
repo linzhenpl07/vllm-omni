@@ -44,13 +44,15 @@ class RefHintCacheState(Generic[ValueT]):
         self.hits: int = 0
         self.misses: int = 0
 
-    def reset(self) -> None:
-        """Clear retained values and counters for a new generation."""
+    def reset(self) -> tuple[ValueT, ...]:
+        """Clear retained values and return them to the backend for disposal."""
+        retained = tuple(value for history in self._history.values() for _, value in history)
         self._history.clear()
         self._last_step = None
         self._call_idx = 0
         self.hits = 0
         self.misses = 0
+        return retained
 
     def begin_call(self, step: int | None) -> tuple[int | None, bool]:
         """Return ``(branch, should_refresh)`` for this region invocation."""
@@ -79,7 +81,7 @@ class RefHintCacheState(Generic[ValueT]):
         self.hits += 1
         return tuple(self._history[branch])
 
-    def prepare_refresh(self, branch: int | None) -> None:
+    def prepare_refresh(self, branch: int | None) -> tuple[ValueT, ...]:
         """Release history that cannot participate in the next forecast.
 
         Once a refresh has been scheduled, only the latest fresh observation
@@ -88,10 +90,13 @@ class RefHintCacheState(Generic[ValueT]):
         complete values at the refresh-time memory peak.
         """
         if branch is None or self.strategy != _FORECAST50:
-            return
+            return ()
         history = self._history.get(branch)
         if history is not None and len(history) > 1:
+            evicted = tuple(value for _, value in history[:-1])
             del history[:-1]
+            return evicted
+        return ()
 
     def store(self, branch: int | None, step: int | None, value: ValueT) -> None:
         """Retain a fresh value; unknown branch/step calls are deliberate no-ops."""

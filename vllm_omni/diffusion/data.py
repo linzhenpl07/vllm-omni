@@ -396,7 +396,8 @@ class DiffusionCacheConfig:
         - step_cache: step_cache_dit_enabled, velocity_sim_thresholds,
                           velocity_skip_countdowns, step_cache_dit_min_history
         - ref_hint: ref_hint_refresh_interval, ref_hint_strategy,
-                    ref_hint_acknowledge_lossy
+                    ref_hint_acknowledge_lossy, ref_hint_cpu_offload,
+                    ref_hint_cpu_memory_limit_mb
 
     Example:
         >>> # From dict (user-facing API) - partial config uses defaults for missing keys
@@ -438,6 +439,14 @@ class DiffusionCacheConfig:
     # Any skipped hint computation is approximate and must be explicitly acknowledged.
     # ref_hint_refresh_interval=1 recomputes every step and is exempt.
     ref_hint_acknowledge_lossy: bool = False
+    # Keep forecast50 K=2 history in reusable pinned host buffers instead of
+    # retaining two complete observations on the GPU. Disabled by default
+    # because it trades host memory and PCIe/NVLink traffic for lower GPU peak.
+    ref_hint_cpu_offload: bool = False
+    # Hard cap for pinned reference-hint buffers owned by one backend instance.
+    # Exceeding the cap fails explicitly instead of silently returning to the
+    # higher-VRAM GPU-history path.
+    ref_hint_cpu_memory_limit_mb: int = 4096
 
     # cache-dit parameters [cache-dit only]
     # Default: 1 forward compute block (optimized for single-transformer models)

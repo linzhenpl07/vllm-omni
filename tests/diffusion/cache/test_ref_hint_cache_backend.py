@@ -12,6 +12,9 @@ import torch.nn as nn
 pytest.importorskip("vllm")
 
 from vllm_omni.diffusion.cache.ref_hint_cache import RefHintCacheBackend  # noqa: E402
+from vllm_omni.diffusion.cache.ref_hint_cache.backend import (  # noqa: E402
+    _PinnedHintBufferPool,
+)
 from vllm_omni.diffusion.data import DiffusionCacheConfig  # noqa: E402
 from vllm_omni.diffusion.forward_context import (  # noqa: E402
     ForwardContext,
@@ -23,6 +26,7 @@ from vllm_omni.diffusion.model_region import ModelRegion  # noqa: E402
 class _VaceLikeTransformer(nn.Module):
     def __init__(self):
         super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(()))
         self.vace_blocks = nn.ModuleList([nn.Identity()])
 
 
@@ -197,6 +201,96 @@ def test_forecast50_k2_reuses_oldest_storage_and_evicts_before_refresh():
     history = backend._states[id(owner)].history(0)
     assert [step for step, _ in history] == [1, 3]
     assert len(created) == 3
+
+
+def test_cpu_offload_rejects_unsupported_strategy_or_interval():
+    owner = _VaceLikeTransformer()
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=2,
+            ref_hint_strategy="reuse",
+            ref_hint_acknowledge_lossy=True,
+            ref_hint_cpu_offload=True,
+        )
+    )
+    with pytest.raises(ValueError, match="forecast50"):
+        backend.enable(_FakePipeline(owner))
+
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=3,
+            ref_hint_strategy="forecast50",
+            ref_hint_acknowledge_lossy=True,
+            ref_hint_cpu_offload=True,
+        )
+    )
+    with pytest.raises(ValueError, match="refresh_interval=2"):
+        backend.enable(_FakePipeline(owner))
+
+
+def test_pinned_pool_reuses_matching_buffers_and_enforces_limit():
+    source = torch.empty(4, dtype=torch.float32)
+    pool = _PinnedHintBufferPool(source.numel() * source.element_size(), pin_memory=False)
+    first = pool.acquire_like(source)
+    first_ptr = first.data_ptr()
+    pool.release([first])
+    second = pool.acquire_like(source)
+    assert second.data_ptr() == first_ptr
+    assert pool.allocated_bytes == source.numel() * source.element_size()
+
+    with pytest.raises(MemoryError, match="pinned CPU buffer limit exceeded"):
+        pool.acquire_like(source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_cpu_offload_reuses_pool_and_copies_on_dedicated_stream():
+    owner = _VaceLikeTransformer().cuda()
+    pipeline = _FakePipeline(owner)
+    backend = RefHintCacheBackend(
+        _cfg(
+            ref_hint_refresh_interval=2,
+            ref_hint_strategy="forecast50",
+            ref_hint_acknowledge_lossy=True,
+            ref_hint_cpu_offload=True,
+            ref_hint_cpu_memory_limit_mb=1,
+        )
+    )
+    backend.enable(pipeline)
+    context = ForwardContext()
+
+    def run_request():
+        with override_forward_context(context):
+            context.denoise_step_idx = 0
+            backend.execute(
+                ModelRegion.REFERENCE_HINTS,
+                owner,
+                lambda: [torch.tensor([0.0], device="cuda")],
+            )
+            context.denoise_step_idx = 1
+            backend.execute(
+                ModelRegion.REFERENCE_HINTS,
+                owner,
+                lambda: [torch.tensor([2.0], device="cuda")],
+            )
+            context.denoise_step_idx = 2
+            result = backend.execute(
+                ModelRegion.REFERENCE_HINTS,
+                owner,
+                lambda: [torch.tensor([99.0], device="cuda")],
+            )
+        torch.accelerator.synchronize()
+        return result
+
+    result = run_request()
+    assert torch.equal(result[0].cpu(), torch.tensor([2.5]))
+    assert all(value.tensors[0].is_pinned() for _, value in backend._states[id(owner)].history(0))
+    allocated = backend._pinned_pool.allocated_bytes
+    assert allocated == 2 * torch.tensor([0.0]).nbytes
+    assert len(backend._copy_streams) == 1
+
+    backend.finish_request(pipeline)
+    run_request()
+    assert backend._pinned_pool.allocated_bytes == allocated
 
 
 def test_finish_request_releases_retained_hints():

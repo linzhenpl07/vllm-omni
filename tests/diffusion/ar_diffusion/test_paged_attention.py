@@ -20,6 +20,10 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     ar_diffusion_paged_attention,
     paged_write_attn,
 )
+from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    PagedSequenceMetadata,
+    batch_paged_metadata,
+)
 from vllm_omni.experimental.ar_diffusion.kv_cache.state import ARDiffusionKVState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -419,3 +423,218 @@ def test_custom_op_compiles_fullgraph_without_recompile_on_value_change():
         # Leave a clean dynamo state for later suites in the same pytest process
         # (e.g. model_executor transformers models).
         torch._dynamo.reset()
+
+
+# ---------------------------------------------------------------------------
+# Cross-session batching: is the attention path already varlen-capable?
+#
+# Coalescing several sessions' chunks into one forward is only a plumbing
+# change if the attention path already handles a batch of sequences with
+# different KV lengths. These tests establish that against the same dense
+# reference the single-sequence tests use, so the claim rests on a measurement
+# rather than on reading the code.
+# ---------------------------------------------------------------------------
+
+
+def _write_sequence(kv, *, blocks, kv_len, dtype, device):
+    """Fill ``kv_len`` tokens across ``blocks``, returning the dense K/V written."""
+    k = torch.randn(1, kv_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(1, kv_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    positions = torch.arange(kv_len, device=device)
+    logical = torch.div(positions, BLOCK, rounding_mode="floor")
+    offsets = positions % BLOCK
+    physical = torch.tensor(blocks, device=device)[logical]
+    slots = physical * BLOCK + offsets
+    kv._k_pools[0][slots] = k[0]
+    kv._v_pools[0][slots] = v[0]
+    return k, v
+
+
+def _batch_metadata(sequences, *, width, device):
+    """Build batch metadata through the primitive the runtime would use."""
+    table, starts, lens, _, _ = batch_paged_metadata(
+        [PagedSequenceMetadata(block_ids=tuple(b), kv_len=k, query_len=q) for b, k, q in sequences],
+        block_size=BLOCK,
+        device=device,
+        width=width,
+    )
+    return table, starts, lens
+
+
+def _run_paged(kv, query_flat, table, starts, lens, *, max_seq_len):
+    return ar_diffusion_paged_attention(
+        query_flat,
+        kv.key_cache(0),
+        kv.value_cache(0),
+        block_table=table,
+        query_start_loc=starts,
+        seq_lens=lens,
+        max_query_len=int((starts[1:] - starts[:-1]).max().item()),
+        max_seq_len=max_seq_len,
+        softmax_scale=HEAD_DIM**-0.5,
+        causal=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # (blocks, kv_len, query_len) per sequence. Unequal KV lengths are the
+        # point: equal lengths would pass even for a batch-oblivious path.
+        [((1, 2), 32, 16), ((3, 4, 5), 40, 8)],
+        [((1,), 5, 3), ((2, 3), 27, 11), ((4, 5, 6), 48, 16)],
+    ],
+)
+def test_batched_sequences_match_running_them_one_at_a_time(spec):
+    """A coalesced batch must equal the same sequences run separately.
+
+    This is the load-bearing question for cross-session chunk batching: if it
+    holds, coalescing needs new metadata construction and nothing else in the
+    attention path.
+    """
+    torch.manual_seed(0)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, _ = make_state(dtype=dtype, device=device, window_chunks=8)
+
+    queries = []
+    for blocks, kv_len, query_len in spec:
+        _write_sequence(kv, blocks=blocks, kv_len=kv_len, dtype=dtype, device=device)
+        queries.append(torch.randn(query_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device))
+
+    width = max(len(blocks) for blocks, _, _ in spec)
+    max_seq_len = width * BLOCK
+    table, starts, lens = _batch_metadata(spec, width=width, device=device)
+    batched = _run_paged(kv, torch.cat(queries, dim=0), table, starts, lens, max_seq_len=max_seq_len)
+
+    alone = []
+    for index, (blocks, kv_len, _) in enumerate(spec):
+        one = _batch_metadata([(blocks, kv_len, queries[index].shape[0])], width=width, device=device)
+        alone.append(_run_paged(kv, queries[index], *one, max_seq_len=max_seq_len))
+
+    expected = torch.cat(alone, dim=0)
+    assert batched.shape == expected.shape
+    torch.testing.assert_close(batched, expected, rtol=1e-5, atol=1e-5)
+
+
+def test_each_batched_sequence_matches_the_dense_reference():
+    """Anchor the batch against dense attention, not only against itself.
+
+    Comparing a batch to per-sequence paged calls would pass even if both
+    shared a bug, so each member is also checked against plain attention over
+    the exact K/V it should see.
+    """
+    torch.manual_seed(1)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, _ = make_state(dtype=dtype, device=device, window_chunks=8)
+
+    spec = [((1, 2), 32, 16), ((3, 4, 5), 40, 8)]
+    dense_kv, queries = [], []
+    for blocks, kv_len, query_len in spec:
+        dense_kv.append(_write_sequence(kv, blocks=blocks, kv_len=kv_len, dtype=dtype, device=device))
+        queries.append(torch.randn(query_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device))
+
+    width = max(len(blocks) for blocks, _, _ in spec)
+    table, starts, lens = _batch_metadata(spec, width=width, device=device)
+    batched = _run_paged(kv, torch.cat(queries, dim=0), table, starts, lens, max_seq_len=width * BLOCK)
+
+    offset = 0
+    for index, (_, _, query_len) in enumerate(spec):
+        k, v = dense_kv[index]
+        ref = _dense_attention(queries[index].unsqueeze(0), k, v)[0]
+        torch.testing.assert_close(batched[offset : offset + query_len], ref, rtol=1e-5, atol=1e-5)
+        offset += query_len
+
+
+def test_batching_is_not_vacuous_because_the_sequences_differ():
+    """Negative control for the two tests above.
+
+    If both members produced the same output, an implementation that ignored
+    the per-sequence block table entirely would still pass.
+    """
+    torch.manual_seed(2)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, _ = make_state(dtype=dtype, device=device, window_chunks=8)
+
+    spec = [((1, 2), 32, 8), ((3, 4), 32, 8)]
+    for blocks, kv_len, _ in spec:
+        _write_sequence(kv, blocks=blocks, kv_len=kv_len, dtype=dtype, device=device)
+    query = torch.randn(8, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+
+    table, starts, lens = _batch_metadata(spec, width=2, device=device)
+    batched = _run_paged(kv, torch.cat([query, query], dim=0), table, starts, lens, max_seq_len=2 * BLOCK)
+
+    # Same query, different KV: the two halves must differ.
+    assert not torch.allclose(batched[:8], batched[8:], rtol=1e-3, atol=1e-3)
+
+
+def test_padding_beyond_seq_len_is_never_read():
+    """A short sequence in a wide batch must ignore its padded block slots.
+
+    Coalescing pads every session's table to the widest member, so a session
+    reading past its own KV would silently mix in another session's blocks --
+    a plausible but wrong result that no timing metric can detect.
+    """
+    torch.manual_seed(3)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, _ = make_state(dtype=dtype, device=device, window_chunks=8)
+
+    short_len = 12
+    k, v = _write_sequence(kv, blocks=(1,), kv_len=short_len, dtype=dtype, device=device)
+    _write_sequence(kv, blocks=(3, 4, 5), kv_len=40, dtype=dtype, device=device)
+    query = torch.randn(6, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+
+    # Pad the short sequence's table with blocks holding real, different data.
+    table = torch.tensor([[1, 3, 4]], dtype=torch.int32, device=device)
+    starts = torch.tensor([0, 6], dtype=torch.int32, device=device)
+    lens = torch.tensor([short_len], dtype=torch.int32, device=device)
+    out = _run_paged(kv, query, table, starts, lens, max_seq_len=3 * BLOCK)
+
+    ref = _dense_attention(query.unsqueeze(0), k, v)[0]
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_batch_paged_metadata_rejects_tables_too_small_for_their_kv():
+    """Silently truncating a session's KV is the failure to avoid here."""
+    with pytest.raises(ValueError, match="needs 3 blocks"):
+        batch_paged_metadata(
+            [PagedSequenceMetadata(block_ids=(1, 2), kv_len=40, query_len=4)],
+            block_size=BLOCK,
+            device=torch.device("cpu"),
+        )
+
+
+def test_batch_paged_metadata_pads_every_row_to_the_widest_member():
+    table, starts, lens, max_query_len, max_seq_len = batch_paged_metadata(
+        [
+            PagedSequenceMetadata(block_ids=(1,), kv_len=10, query_len=4),
+            PagedSequenceMetadata(block_ids=(2, 3, 4), kv_len=40, query_len=9),
+        ],
+        block_size=BLOCK,
+        device=torch.device("cpu"),
+    )
+    assert table.shape == (2, 3)
+    assert table[0].tolist() == [1, 0, 0]
+    assert starts.tolist() == [0, 4, 13]
+    assert lens.tolist() == [10, 40]
+    assert (max_query_len, max_seq_len) == (9, 3 * BLOCK)
+
+
+def test_batch_paged_metadata_matches_the_single_sequence_builder():
+    """One sequence through the batch primitive equals the existing path."""
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2)
+    ctx = st.get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+    single = ctx.build_block_table(action_len=0, query_len=BLOCK, device=device)
+
+    blocks, _ = ctx.video_block_table(device)
+    batched = batch_paged_metadata(
+        [PagedSequenceMetadata(block_ids=tuple(blocks), kv_len=ctx.kv_len, query_len=BLOCK)],
+        block_size=BLOCK,
+        device=device,
+        width=single[0].shape[1],
+    )
+    torch.testing.assert_close(batched[0], single[0])
+    torch.testing.assert_close(batched[1], single[1])
+    torch.testing.assert_close(batched[2], single[2])
+    assert batched[3] == single[3]

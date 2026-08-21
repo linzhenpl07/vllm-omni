@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, NamedTuple
 
@@ -301,6 +302,79 @@ class ARDiffusionPagedLayerContext:
     def to_layer_inputs(self) -> ARDiffusionPagedLayerInputs:
         """Compiled-region payload; requires ``forward_ctx.prepare()`` first."""
         return self.forward_ctx.layer_inputs(self.layer_idx)
+
+
+@dataclass(frozen=True)
+class PagedSequenceMetadata:
+    """One sequence's contribution to a coalesced forward.
+
+    ``block_ids`` are the physical blocks holding its KV in visit order,
+    ``kv_len`` how many of those tokens are live, and ``query_len`` how many
+    query tokens it contributes to the batch.
+    """
+
+    block_ids: tuple[int, ...]
+    kv_len: int
+    query_len: int
+
+    def __post_init__(self) -> None:
+        if not self.block_ids:
+            raise ValueError("A paged sequence needs at least one block.")
+        if self.kv_len <= 0 or self.query_len <= 0:
+            raise ValueError("kv_len and query_len must be positive.")
+
+
+def batch_paged_metadata(
+    sequences: Sequence[PagedSequenceMetadata],
+    *,
+    block_size: int,
+    device: torch.device,
+    width: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Merge per-sequence tables into one varlen batch.
+
+    Returns the same five values ``build_block_table`` returns for a single
+    sequence, so a coalesced forward reaches the attention kernel through the
+    identical path -- the kernel already consumes ``block_table`` per row and
+    ``seq_lens`` per sequence.
+
+    Every row is padded to the widest member. Padding is never read: the
+    kernel dereferences only ``ceil(seq_lens / block_size)`` entries, which is
+    what keeps a short session from mixing in a neighbour's blocks. That is
+    asserted in ``tests/diffusion/ar_diffusion/test_paged_attention.py`` rather
+    than assumed, because the failure it prevents -- one session reading
+    another's KV -- produces a plausible but wrong result that no timing metric
+    can detect.
+    """
+    if not sequences:
+        raise ValueError("A coalesced batch needs at least one sequence.")
+    if block_size <= 0:
+        raise ValueError("block_size must be positive.")
+    for sequence in sequences:
+        needed = -(-sequence.kv_len // block_size)
+        if needed > len(sequence.block_ids):
+            raise ValueError(
+                f"kv_len={sequence.kv_len} needs {needed} blocks but only {len(sequence.block_ids)} were supplied."
+            )
+
+    resolved_width = max(len(sequence.block_ids) for sequence in sequences)
+    if width is not None:
+        if width < resolved_width:
+            raise ValueError(f"width={width} is narrower than the widest sequence ({resolved_width}).")
+        resolved_width = width
+
+    table = torch.tensor(
+        [list(s.block_ids) + [0] * (resolved_width - len(s.block_ids)) for s in sequences],
+        dtype=torch.int32,
+        device=device,
+    )
+    starts = [0]
+    for sequence in sequences:
+        starts.append(starts[-1] + sequence.query_len)
+    query_start_loc = torch.tensor(starts, dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([s.kv_len for s in sequences], dtype=torch.int32, device=device)
+    max_query_len = max(s.query_len for s in sequences)
+    return table, query_start_loc, seq_lens, max_query_len, resolved_width * block_size
 
 
 def is_ar_diffusion_paged_context(value: object) -> bool:

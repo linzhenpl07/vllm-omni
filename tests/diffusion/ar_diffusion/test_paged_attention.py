@@ -1214,3 +1214,44 @@ def test_the_shipped_resolution_geometry_matches_dense_attention():
         torch.cat([history_v, current_v], dim=1),
     )
     torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not _gpu_flash_attn_usable(), reason="usable GPU FlashAttention is required")
+@pytest.mark.parametrize("commit_current", [False, True])
+def test_the_shipped_resolution_geometry_on_the_real_kernel(commit_current):
+    """The shipped 832x480 geometry through FlashAttention's paged kernel.
+
+    The CPU test above proves the addressing is right against a dense
+    reference. This one proves the real kernel agrees, at the real 1560
+    tokens per frame, through the production path -- host prep followed by
+    the fused write+attend op, which is what a forward actually calls.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    dtype = torch.float16
+    tokens_per_frame = (480 // 16) * (832 // 16)
+    assert tokens_per_frame == 1560
+
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2, chunk_size=tokens_per_frame)
+    history_k, history_v = _commit_video_span(
+        kv, st, kv_branch=POS, n_chunks=1, dtype=dtype, device=device, chunk_size=tokens_per_frame
+    )
+
+    layer_ctx = st.get_kv_caches(POS, seq_len=tokens_per_frame, commit_current=commit_current)[0]
+    ctx = layer_ctx.forward_ctx
+    current_k = torch.randn(1, tokens_per_frame, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    current_v = torch.randn(1, tokens_per_frame, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    query = torch.randn(1, tokens_per_frame, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+
+    ctx.prepare(device=device, action_len=0, query_len=tokens_per_frame)
+    assert ctx.start_offset == 8, "1560 % 16 == 8 is the whole reason this case exists"
+    assert kv.block_size == 16
+
+    inputs = layer_ctx.to_layer_inputs()
+    paged = paged_write_attn(inputs, query[0], current_k[0], current_v[0], None, None, HEAD_DIM**-0.5).unsqueeze(0)
+
+    new_k = torch.cat([history_k, current_k], dim=1)[:, -kv.spec.sliding_window :]
+    new_v = torch.cat([history_v, current_v], dim=1)[:, -kv.spec.sliding_window :]
+    ref = _dense_attention(query, new_k, new_v)
+
+    torch.testing.assert_close(paged, ref, rtol=2e-2, atol=2e-2)

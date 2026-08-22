@@ -30,8 +30,18 @@ class RealtimeBackend:
     engine: Any
 
 
-async def build_realtime_backend(args: argparse.Namespace) -> RealtimeBackend:
-    """Build an AsyncOmni engine and a session manager from CLI arguments."""
+async def build_realtime_backend(
+    args: argparse.Namespace,
+    *,
+    control_reducer_factory: Any = None,
+) -> RealtimeBackend:
+    """Build an AsyncOmni engine and a session manager from CLI arguments.
+
+    ``control_reducer_factory`` is how a model that requires per-tick controls
+    plugs itself in without this harness knowing anything about it. LingBot
+    World refuses a tick that carries no camera control, so driving it needs
+    one; a pipeline with no controls leaves this None and is unaffected.
+    """
     from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
     from vllm_omni.experimental.ar_diffusion.session import (
@@ -60,7 +70,20 @@ async def build_realtime_backend(args: argparse.Namespace) -> RealtimeBackend:
         model_config=model_config,
     )
 
-    sampling = OmniDiffusionSamplingParams(seed=args.seed, output_type="latent")
+    # Every sampling knob the deployed path sets has to be set here too. A
+    # missing one does not error -- it silently takes a library default, and
+    # then whatever is being compared was produced by a different sampler than
+    # the one that runs in production. num_inference_steps and flow_shift in
+    # particular change the picture outright.
+    sampling_kwargs: dict[str, Any] = {"seed": args.seed, "output_type": "latent"}
+    for field in ("height", "width", "num_frames", "num_inference_steps", "max_sequence_length"):
+        value = getattr(args, field, None)
+        if value is not None:
+            sampling_kwargs[field] = value
+    extra = getattr(args, "sampling_extra_args", None)
+    if extra:
+        sampling_kwargs["extra_args"] = dict(extra)
+    sampling = OmniDiffusionSamplingParams(**sampling_kwargs)
 
     def prompt_provider(tick: Any) -> dict[str, Any]:
         prompt: dict[str, Any] = {"prompt": tick.prompt or args.prompt}
@@ -78,6 +101,7 @@ async def build_realtime_backend(args: argparse.Namespace) -> RealtimeBackend:
         tick_consumer=consumer,
         lifecycle=ARDiffusionWorkerLifecycle(engine, stage_ids=[0], timeout=180.0),
         max_pending_events=args.max_pending_events,
+        control_reducer_factory=control_reducer_factory,
     )
     return RealtimeBackend(manager=manager, spec=_declared_spec(engine), engine=engine)
 

@@ -648,9 +648,21 @@ def test_batch_paged_metadata_matches_the_single_sequence_builder():
 # contexts instead, which is what a coalesced tick will do.
 
 
-def make_sessions(count: int, *, window_chunks=8, dtype=torch.float32, device=torch.device("cpu"), num_layers=1):
-    """Several sessions sharing one KV pool, each with its own adapter."""
-    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
+def make_sessions(
+    count: int,
+    *,
+    window_chunks=8,
+    dtype=torch.float32,
+    device=torch.device("cpu"),
+    num_layers=1,
+    scratch_slots=1,
+):
+    """Several sessions sharing one KV pool, each with its own adapter.
+
+    ``scratch_slots`` defaults to 1, matching deployments that never coalesce;
+    sessions then all address scratch region 0.
+    """
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks, scratch_slots=scratch_slots)
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -667,7 +679,13 @@ def make_sessions(count: int, *, window_chunks=8, dtype=torch.float32, device=to
         device=device,
     )
     sessions = [
-        ARDiffusionKVState(kv, f"s{index}", {POS: kv.begin_request(f"r{index}")}, num_layers=num_layers)
+        ARDiffusionKVState(
+            kv,
+            f"s{index}",
+            {POS: kv.begin_request(f"r{index}")},
+            num_layers=num_layers,
+            scratch_slot=index % max(scratch_slots, 1),
+        )
         for index in range(count)
     ]
     return kv, sessions
@@ -875,3 +893,79 @@ def test_uncommitted_sessions_on_one_branch_are_refused_not_silently_merged():
 
     with pytest.raises(ValueError, match="overlapping KV slots"):
         CoalescedPagedForward.merge(contexts).layer_inputs(0)
+
+
+def test_scratch_slots_give_uncommitted_sessions_disjoint_write_targets():
+    """The fix for the collision the refusal above documents.
+
+    With one region per session, two sessions preparing uncommitted chunks
+    address different blocks, so a coalesced forward writes each session's K/V
+    where only that session reads it.
+    """
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, sessions = make_sessions(2, dtype=dtype, device=device, scratch_slots=2)
+
+    contexts = [
+        _prepared_context(kv, session, history_chunks=1, dtype=dtype, device=device, commit_current=False)
+        for session in sessions
+    ]
+
+    assert set(contexts[0].current_video_block_ids).isdisjoint(contexts[1].current_video_block_ids)
+    merged = CoalescedPagedForward.merge(contexts)
+    assert merged.video_slots.numel() == sum(c.current_video_slot_mapping.numel() for c in contexts)
+
+
+def test_coalesced_uncommitted_sessions_match_running_them_one_at_a_time():
+    """Equivalence for the case that actually dominates: the noisy steps.
+
+    Four of every five forwards per block are non-committing, so this is the
+    path coalescing has to be correct on, not the committing one.
+    """
+    torch.manual_seed(11)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, sessions = make_sessions(2, dtype=dtype, device=device, scratch_slots=2)
+
+    contexts = [
+        _prepared_context(kv, sessions[0], history_chunks=1, dtype=dtype, device=device, commit_current=False),
+        _prepared_context(kv, sessions[1], history_chunks=3, dtype=dtype, device=device, commit_current=False),
+    ]
+    assert contexts[0].kv_len != contexts[1].kv_len, "sessions must differ or the test is vacuous"
+
+    queries = [torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device) for _ in contexts]
+    keys = [torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device) for _ in contexts]
+    values = [torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device) for _ in contexts]
+
+    alone = [
+        paged_write_attn(ctx.layer_inputs(0), queries[i], keys[i], values[i], None, None, HEAD_DIM**-0.5)
+        for i, ctx in enumerate(contexts)
+    ]
+    coalesced = paged_write_attn(
+        CoalescedPagedForward.merge(contexts).layer_inputs(0),
+        torch.cat(queries, dim=0),
+        torch.cat(keys, dim=0),
+        torch.cat(values, dim=0),
+        None,
+        None,
+        HEAD_DIM**-0.5,
+    )
+
+    torch.testing.assert_close(coalesced, torch.cat(alone, dim=0), rtol=1e-5, atol=1e-5)
+
+
+def test_a_session_cannot_claim_a_slot_the_cache_did_not_reserve():
+    """Sizing and addressing must not drift apart silently."""
+    kv, _ = make_sessions(1, scratch_slots=1)
+    with pytest.raises(ValueError, match="scratch_slot must be in"):
+        ARDiffusionKVState(kv, "extra", {POS: kv.begin_request("r-extra")}, num_layers=1, scratch_slot=1)
+
+    with pytest.raises(ValueError, match="scratch slot must be in"):
+        kv.scratch_block_ids(POS, 0, 1, slot=1)
+
+
+def test_reserving_more_slots_costs_proportionally_more_scratch():
+    """The memory price of coalescing is explicit, not hidden."""
+    one, _ = make_sessions(1, scratch_slots=1)
+    three, _ = make_sessions(1, scratch_slots=3)
+
+    assert three.scratch_blocks_per_slot == one.scratch_blocks_per_slot
+    assert three.scratch_num_blocks == 3 * one.scratch_num_blocks

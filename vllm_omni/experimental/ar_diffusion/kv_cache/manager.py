@@ -249,8 +249,18 @@ class ARDiffusionKVCache:
         if override_blocks < 0:
             raise ValueError("AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH must be non-negative")
         scratch_per_kv_branch = max(minimum_scratch_blocks, override_blocks)
-        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch
-        self.scratch_num_blocks = self.num_local_kv_branches * scratch_per_kv_branch
+        # One independent region per slot. Scratch is where a non-committing
+        # forward writes its current chunk, so sessions that may be in flight
+        # together need regions of their own or they overwrite each other --
+        # silently, since the shapes stay right. Slots default to 1, which is
+        # a single region per branch and costs exactly what it did before.
+        scratch_slots = int(getattr(config, "scratch_slots", 1) or 1)
+        if scratch_slots < 1:
+            raise ValueError(f"ARDiffusionKVConfig.scratch_slots must be at least 1, got {scratch_slots}")
+        self.scratch_slots = scratch_slots
+        self.scratch_blocks_per_slot = scratch_per_kv_branch
+        self.scratch_blocks_per_kv_branch = scratch_per_kv_branch * scratch_slots
+        self.scratch_num_blocks = self.num_local_kv_branches * self.scratch_blocks_per_kv_branch
 
         # The self-attention pool, scratch pool, and lazily materialized
         # cross-attention caches share one hard memory budget. Select the largest
@@ -575,19 +585,25 @@ class ARDiffusionKVCache:
             self.block_size,
         )
 
-    def scratch_block_ids(self, kv_branch: str, start: int, count: int) -> list[int]:
-        """Return KV-branch-local scratch block ids outside manager ownership."""
+    def scratch_block_ids(self, kv_branch: str, start: int, count: int, *, slot: int = 0) -> list[int]:
+        """Return scratch block ids for one (KV branch, slot) region.
+
+        Regions are disjoint by construction, which is what lets two sessions
+        prepare uncommitted chunks in the same coalesced forward.
+        """
         if count < 0 or start < 0:
             raise ValueError(f"scratch start/count must be non-negative, got start={start}, count={count}")
-        if start + count > self.scratch_blocks_per_kv_branch:
+        if not 0 <= slot < self.scratch_slots:
+            raise ValueError(f"scratch slot must be in [0, {self.scratch_slots}), got {slot}")
+        if start + count > self.scratch_blocks_per_slot:
             raise RuntimeError(
                 "AR-Diffusion paged attention scratch blocks exhausted: "
-                f"need [{start}, {start + count}) of {self.scratch_blocks_per_kv_branch}. "
+                f"need [{start}, {start + count}) of {self.scratch_blocks_per_slot}. "
                 "Declare max_scratch_tokens_per_branch in the pipeline capability "
                 "or increase AR_DIFFUSION_KV_SCRATCH_BLOCKS_PER_BRANCH."
             )
-        kv_branch_offset = self.scratch_blocks_per_kv_branch * self._kv_branch_index(kv_branch)
-        base = self.managed_num_blocks + kv_branch_offset + start
+        region = self._kv_branch_index(kv_branch) * self.scratch_slots + slot
+        base = self.managed_num_blocks + region * self.scratch_blocks_per_slot + start
         return list(range(base, base + count))
 
     def key_cache(self, layer_idx: int) -> torch.Tensor:

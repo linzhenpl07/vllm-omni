@@ -21,6 +21,7 @@ from vllm_omni.experimental.ar_diffusion.kv_cache import (
     paged_write_attn,
 )
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged_attention import (
+    CoalescedPagedForward,
     PagedSequenceMetadata,
     batch_paged_metadata,
 )
@@ -638,3 +639,239 @@ def test_batch_paged_metadata_matches_the_single_sequence_builder():
     torch.testing.assert_close(batched[1], single[1])
     torch.testing.assert_close(batched[2], single[2])
     assert batched[3] == single[3]
+
+
+# ── Coalescing real session contexts ───────────────────────────────────────
+#
+# The tests above establish that the attention path is varlen-capable given
+# hand-built metadata. These build the metadata from actual per-session forward
+# contexts instead, which is what a coalesced tick will do.
+
+
+def make_sessions(count: int, *, window_chunks=8, dtype=torch.float32, device=torch.device("cpu"), num_layers=1):
+    """Several sessions sharing one KV pool, each with its own adapter."""
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
+    kv = ARDiffusionKVCache(
+        cfg,
+        num_layers=num_layers,
+        num_kv_heads=N_HEADS,
+        head_size=HEAD_DIM,
+        dtype=dtype,
+        block_size=BLOCK,
+        max_model_len=4096,
+        available_bytes=1 << 26,
+        kv_branches=(ARDiffusionKVBranchSpec(POS, 0),),
+        session_capacity=count,
+        frames_per_block=2,
+        max_scratch_tokens_per_branch=BLOCK,
+        device=device,
+    )
+    sessions = [
+        ARDiffusionKVState(kv, f"s{index}", {POS: kv.begin_request(f"r{index}")}, num_layers=num_layers)
+        for index in range(count)
+    ]
+    return kv, sessions
+
+
+def _prepared_context(kv, session, *, history_chunks, dtype, device, commit_current=False):
+    """Give a session some committed history, then prepare its current chunk."""
+    for _ in range(history_chunks):
+        ctx = session.get_kv_caches(POS, seq_len=BLOCK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(device)
+        kv._k_pools[0][ctx.current_video_slot_mapping] = torch.randn(
+            BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device
+        )
+        kv._v_pools[0][ctx.current_video_slot_mapping] = torch.randn(
+            BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device
+        )
+        session.commit_paged_context(POS)
+
+    ctx = session.get_kv_caches(POS, seq_len=BLOCK, commit_current=commit_current)[0].forward_ctx
+    ctx.prepare(device, 0, BLOCK)
+    return ctx
+
+
+def test_a_single_context_through_the_batch_primitive_is_unchanged():
+    """The one-session case must be bit-identical to the existing path.
+
+    Coalescing has to be free when there is nothing to coalesce, otherwise
+    enabling it would change single-session results.
+    """
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, (session,) = make_sessions(1, dtype=dtype, device=device)
+    ctx = _prepared_context(kv, session, history_chunks=2, dtype=dtype, device=device)
+
+    alone = ctx.layer_inputs(0)
+    batched = CoalescedPagedForward.merge([ctx]).layer_inputs(0)
+
+    for field in ARDiffusionPagedLayerInputs._fields:
+        left, right = getattr(alone, field), getattr(batched, field)
+        if isinstance(left, torch.Tensor):
+            torch.testing.assert_close(left, right, rtol=0, atol=0)
+        else:
+            assert left == right, field
+
+
+def test_coalesced_sessions_equal_the_same_sessions_run_one_at_a_time():
+    """The load-bearing test: two sessions in one forward vs. two forwards.
+
+    Sessions are given different history depths on purpose, so their KV lengths
+    and block tables differ. Equal-length sessions would pass even for an
+    implementation that ignored the per-session metadata entirely.
+    """
+    torch.manual_seed(7)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, sessions = make_sessions(2, dtype=dtype, device=device)
+
+    contexts = [
+        _prepared_context(kv, sessions[0], history_chunks=1, dtype=dtype, device=device, commit_current=True),
+        _prepared_context(kv, sessions[1], history_chunks=3, dtype=dtype, device=device, commit_current=True),
+    ]
+    assert contexts[0].kv_len != contexts[1].kv_len, "sessions must differ or the test is vacuous"
+
+    queries, keys, values = [], [], []
+    for _ in contexts:
+        queries.append(torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device))
+        keys.append(torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device))
+        values.append(torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device))
+
+    alone = [
+        paged_write_attn(ctx.layer_inputs(0), queries[i], keys[i], values[i], None, None, HEAD_DIM**-0.5)
+        for i, ctx in enumerate(contexts)
+    ]
+
+    coalesced = paged_write_attn(
+        CoalescedPagedForward.merge(contexts).layer_inputs(0),
+        torch.cat(queries, dim=0),
+        torch.cat(keys, dim=0),
+        torch.cat(values, dim=0),
+        None,
+        None,
+        HEAD_DIM**-0.5,
+    )
+
+    torch.testing.assert_close(coalesced, torch.cat(alone, dim=0), rtol=1e-5, atol=1e-5)
+
+
+def test_a_coalesced_session_does_not_see_its_neighbour_kv():
+    """The failure that timing cannot detect.
+
+    If the shallow session read the deeper one's blocks it would still produce
+    a plausible tensor. Anchor it against dense attention over exactly the K/V
+    that session should see -- its own committed history plus its own chunk.
+    """
+    torch.manual_seed(8)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, sessions = make_sessions(2, dtype=dtype, device=device)
+
+    shallow = _prepared_context(kv, sessions[0], history_chunks=1, dtype=dtype, device=device, commit_current=True)
+    deep = _prepared_context(kv, sessions[1], history_chunks=3, dtype=dtype, device=device, commit_current=True)
+
+    queries = [torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device) for _ in range(2)]
+    keys = [torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device) for _ in range(2)]
+    values = [torch.randn(BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device) for _ in range(2)]
+
+    coalesced = paged_write_attn(
+        CoalescedPagedForward.merge([shallow, deep]).layer_inputs(0),
+        torch.cat(queries, dim=0),
+        torch.cat(keys, dim=0),
+        torch.cat(values, dim=0),
+        None,
+        None,
+        HEAD_DIM**-0.5,
+    )
+
+    # Rebuild what the shallow session should have attended over, straight from
+    # the pool via its own block table.
+    live_blocks = shallow.block_table[0, : -(-shallow.kv_len // BLOCK)].tolist()
+    slots = torch.tensor(
+        [block * BLOCK + offset for block in live_blocks for offset in range(BLOCK)][: shallow.kv_len],
+        dtype=torch.long,
+    )
+    expected = _dense_attention(
+        queries[0].unsqueeze(0),
+        kv._k_pools[0][slots].unsqueeze(0),
+        kv._v_pools[0][slots].unsqueeze(0),
+    )[0]
+
+    torch.testing.assert_close(coalesced[:BLOCK], expected, rtol=1e-5, atol=1e-5)
+
+
+def test_coalescing_keeps_the_block_table_width_fixed_as_the_window_grows():
+    """Shapes must not drift with history, or the compiled graph recompiles.
+
+    The single-session builder pads to a fixed capacity for this reason; the
+    coalesced table has to inherit that rather than sizing itself to whichever
+    sessions happen to be live.
+    """
+    device, dtype = torch.device("cpu"), torch.float32
+    # Four sessions, not two reused: a session may not prepare a second managed
+    # chunk while its first is still pending.
+    kv, sessions = make_sessions(4, dtype=dtype, device=device, window_chunks=4)
+
+    shallow = CoalescedPagedForward.merge(
+        [
+            _prepared_context(kv, session, history_chunks=0, dtype=dtype, device=device, commit_current=True)
+            for session in sessions[:2]
+        ]
+    ).layer_inputs(0)
+    deep = CoalescedPagedForward.merge(
+        [
+            _prepared_context(kv, session, history_chunks=3, dtype=dtype, device=device, commit_current=True)
+            for session in sessions[2:]
+        ]
+    ).layer_inputs(0)
+
+    assert shallow.block_table.shape == deep.block_table.shape
+    assert shallow.max_seq_len == deep.max_seq_len
+    # ...while the values genuinely changed, so the check is not vacuous.
+    assert not torch.equal(shallow.seq_lens, deep.seq_lens)
+
+
+def test_merge_rejects_unprepared_and_foreign_contexts():
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, sessions = make_sessions(2, dtype=dtype, device=device)
+
+    ready = _prepared_context(kv, sessions[0], history_chunks=1, dtype=dtype, device=device, commit_current=True)
+    raw = sessions[1].get_kv_caches(POS, seq_len=BLOCK, commit_current=False)[0].forward_ctx
+
+    with pytest.raises(RuntimeError, match="before prepare"):
+        CoalescedPagedForward.merge([ready, raw]).layer_inputs(0)
+
+    with pytest.raises(ValueError, match="at least one session"):
+        CoalescedPagedForward.merge([])
+
+    other_kv, (other_session,) = make_sessions(1, dtype=dtype, device=device)
+    foreign = _prepared_context(
+        other_kv, other_session, history_chunks=1, dtype=dtype, device=device, commit_current=True
+    )
+    with pytest.raises(ValueError, match="share one KV pool"):
+        CoalescedPagedForward.merge([ready, foreign]).layer_inputs(0)
+
+
+def test_uncommitted_sessions_on_one_branch_are_refused_not_silently_merged():
+    """Scratch blocks are per KV branch, so two uncommitted sessions collide.
+
+    Every noisy denoise step prepares its chunk with ``commit_current=False``
+    and therefore lands on its branch's scratch blocks, which carry no session
+    index. Coalescing two such sessions would have each overwrite the other's
+    current K/V -- a wrong result that still looks like a video. Refusing is
+    the only safe answer until scratch is indexed per session.
+    """
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, sessions = make_sessions(2, dtype=dtype, device=device)
+
+    contexts = [
+        _prepared_context(kv, session, history_chunks=1, dtype=dtype, device=device, commit_current=False)
+        for session in sessions
+    ]
+    # The collision is real, not hypothetical: the write targets are identical.
+    torch.testing.assert_close(
+        contexts[0].current_video_slot_mapping,
+        contexts[1].current_video_slot_mapping,
+        rtol=0,
+        atol=0,
+    )
+
+    with pytest.raises(ValueError, match="overlapping KV slots"):
+        CoalescedPagedForward.merge(contexts).layer_inputs(0)

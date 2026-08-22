@@ -63,6 +63,10 @@ class ARDiffusionPagedForwardContext:
     seq_len: int
     commit_current: bool
     max_video_tokens: int
+    # Which scratch region this session's uncommitted chunk writes to. Sessions
+    # that may be coalesced into one forward must differ here or they overwrite
+    # each other's current K/V.
+    scratch_slot: int = 0
     current_video_block_ids: list[int] = field(default_factory=list)
     current_video_slot_mapping: torch.Tensor | None = None
     action_scratch_block_ids: list[int] = field(default_factory=list)
@@ -108,7 +112,9 @@ class ARDiffusionPagedForwardContext:
             positions = torch.arange(start, start + self.seq_len, dtype=torch.long)
             self.current_video_slot_mapping = compute_slot_mapping(table, positions, self.block_size).to(device=device)
         else:
-            self.current_video_block_ids = self.kv_cache.scratch_block_ids(self.kv_branch, 0, n_blocks)
+            self.current_video_block_ids = self.kv_cache.scratch_block_ids(
+                self.kv_branch, 0, n_blocks, slot=self.scratch_slot
+            )
             positions = torch.arange(self.seq_len, dtype=torch.long)
             self.current_video_slot_mapping = compute_slot_mapping(
                 self.current_video_block_ids,
@@ -135,6 +141,7 @@ class ARDiffusionPagedForwardContext:
             self.kv_branch,
             scratch_offset,
             action_blocks,
+            slot=self.scratch_slot,
         )
         positions = torch.arange(action_len, dtype=torch.long)
         self.action_slot_mapping = compute_slot_mapping(

@@ -10,6 +10,8 @@ same-resolution/different-seed floor was measured to read it against.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -351,3 +353,109 @@ def test_a_batched_decode_is_refused_rather_than_silently_taking_one():
     cli = _cli()
     with pytest.raises(ValueError, match="one session per decode"):
         cli._frames_to_clip(torch.zeros(2, 3, 2, 4, 5))
+
+
+def _write_run(cli, directory, prompt, *, width=48, height=32, seed=0):
+    """A minimal run on disk: two frames and a manifest naming its prompt."""
+    import json
+
+    directory.mkdir(parents=True, exist_ok=True)
+    clip = _structured(1, frames=2, height=height, width=width)
+    for index, blob in enumerate(frames_to_png_bytes(clip)):
+        (directory / f"frame_{index:05d}.png").write_bytes(blob)
+    (directory / cli.MANIFEST).write_text(
+        json.dumps(
+            {
+                "label": directory.name,
+                "width": width,
+                "height": height,
+                "seed": seed,
+                "prompt": prompt,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return directory
+
+
+def test_one_prompt_keeps_the_original_run_name():
+    """Runs generated before prompts were repeatable stay addressable."""
+    cli = _cli()
+    assert cli.run_label(512, 320, 0) == "512x320_seed0"
+    assert cli.run_label(512, 320, 1, 0, prompt_count=1) == "512x320_seed1"
+
+
+def test_several_prompts_get_distinct_run_names():
+    cli = _cli()
+    labels = {cli.run_label(512, 320, seed, index, prompt_count=3) for index in range(3) for seed in (0, 1)}
+    assert len(labels) == 6
+    assert "512x320_p2_seed1" in labels
+
+
+def test_extra_seeds_reach_the_candidate_only_when_asked(monkeypatch):
+    """The default keeps the floor's meaning; --all-seeds repeats the candidate.
+
+    Without this flag a candidate resolution is judged on exactly one sample,
+    which is not enough to call a resolution unusable.
+    """
+    import argparse
+    import asyncio
+
+    cli = _cli()
+    seen = []
+
+    async def fake_generate_one(args, *, width, height, seed, prompt_index=0, prompt_count=1):
+        label = cli.run_label(width, height, seed, prompt_index, prompt_count=prompt_count)
+        seen.append(label)
+        return args.out / label
+
+    monkeypatch.setattr(cli, "generate_one", fake_generate_one)
+
+    def run(all_seeds):
+        seen.clear()
+        args = argparse.Namespace(
+            out=Path("/nowhere"),
+            resolution=[(768, 480), (512, 320)],
+            prompt=["a", "b"],
+            seed=0,
+            floor_seeds=1,
+            all_seeds=all_seeds,
+        )
+        asyncio.run(cli._generate(args))
+        return list(seen)
+
+    default = run(False)
+    # Reference gets both seeds, candidate only one -- per prompt.
+    assert default == [
+        "768x480_p0_seed0",
+        "768x480_p0_seed1",
+        "512x320_p0_seed0",
+        "768x480_p1_seed0",
+        "768x480_p1_seed1",
+        "512x320_p1_seed0",
+    ]
+
+    every = run(True)
+    assert every.count("512x320_p0_seed1") == 1
+    assert len(every) == 8
+
+
+def test_comparing_across_prompts_is_refused(tmp_path):
+    """A distance between two prompts measures the prompts, not resolution."""
+    pytest.importorskip("PIL")
+    import argparse
+
+    cli = _cli()
+    reference = _write_run(cli, tmp_path / "768x480_p0_seed0", "a forest path")
+    candidate = _write_run(cli, tmp_path / "512x320_p1_seed0", "a city street")
+
+    args = argparse.Namespace(reference=reference, candidate=[candidate], floor=[])
+    with pytest.raises(ValueError, match="different prompt"):
+        cli._compare(args)
+
+
+def test_comparing_within_one_prompt_is_allowed(tmp_path):
+    cli = _cli()
+    reference = _write_run(cli, tmp_path / "768x480_p0_seed0", "a forest path")
+    floor = _write_run(cli, tmp_path / "768x480_p0_seed1", "a forest path", seed=1)
+    cli._reject_mixed_prompts(reference, [floor])

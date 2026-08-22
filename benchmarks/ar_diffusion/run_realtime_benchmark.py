@@ -195,6 +195,13 @@ async def _main(args: argparse.Namespace) -> int:
     from vllm_omni.experimental.ar_diffusion import ARDiffusionSessionManager
 
     backend = await build_realtime_backend(args)
+    if backend.spec is None:
+        raise RuntimeError(
+            "The chunk shape is not readable from this engine: either the model does not "
+            "implement SupportsARDiffusionPipeline, or the pipeline lives in a worker "
+            "process this one cannot reach. The load benchmark needs it to build the "
+            "playout grid; the quality comparison does not."
+        )
     frames_per_chunk, frames_per_first_chunk = frames_per_chunk_from_spec(
         backend.spec,
         vae_temporal_factor=args.vae_temporal_factor,

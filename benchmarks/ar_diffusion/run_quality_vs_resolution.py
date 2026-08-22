@@ -88,6 +88,56 @@ def run_label(width: int, height: int, seed: int) -> str:
 # ── generate ───────────────────────────────────────────────────────────────
 
 
+def _device():
+    import torch
+
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _load_vae(model: str, *, device, dtype):
+    """Load the checkpoint's VAE on its own, independent of any engine.
+
+    Deliberately not the ``Distributed`` subclass: that one calls
+    ``init_distributed()`` and asserts on a world group this process does not
+    have, because the engine's own distributed state lives in its worker. One
+    VAE on one device is all a single-session decode needs.
+    """
+    from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_wan import (
+        OmniAutoencoderKLWan,
+    )
+
+    vae = OmniAutoencoderKLWan.from_pretrained(model, subfolder="vae", torch_dtype=dtype)
+    return vae.to(device).eval()
+
+
+def _latent_stats(vae):
+    """Per-channel latent mean/std, shaped to broadcast over [B, C, T, H, W]."""
+    import torch
+
+    shape = (1, -1, 1, 1, 1)
+    mean = torch.as_tensor(vae.config.latents_mean, device=vae.device, dtype=torch.float32).view(*shape)
+    std = torch.as_tensor(vae.config.latents_std, device=vae.device, dtype=torch.float32).view(*shape)
+    return mean, std
+
+
+def _tick_latents(output: Any) -> Any:
+    """Extract one tick's latent tensor, saying what was wrong if it is absent."""
+    payload = getattr(output, "multimodal_output", None)
+    if not isinstance(payload, dict):
+        raise TypeError(
+            f"a tick returned {type(output).__name__} with no multimodal_output mapping; "
+            "the quality tool reads latents from there"
+        )
+    body = payload.get("payload")
+    latents = body.get("latents") if isinstance(body, dict) else None
+    if latents is None:
+        raise KeyError(
+            f"tick output carried no payload.latents (keys: {sorted(payload)}). "
+            "The session must run with output_type='latent'."
+        )
+    return latents
+
+
 def _frames_to_clip(frames: Any) -> Any:
     """Normalise a decoder's ``[B, 3, T, H, W]`` output to ``(T, 3, H, W)``."""
     import torch
@@ -124,17 +174,32 @@ async def generate_one(args: argparse.Namespace, *, width: int, height: int, see
     run_args.model_config_overrides = {"ar_diffusion_height": height, "ar_diffusion_width": width}
 
     backend = await build_realtime_backend(run_args)
-    pipeline = getattr(getattr(backend.engine, "engine", None), "pipeline", None)
-    if pipeline is None or not hasattr(pipeline, "vae"):
-        raise RuntimeError("The engine did not expose a pipeline with a VAE to decode with.")
 
-    decoder = WanStreamingDecoder(pipeline.vae)
+    # Load a VAE here rather than reaching into the engine for one. With
+    # process isolation the pipeline lives in a worker, so ``engine.pipeline``
+    # is None in this process; and a decoder that a benchmark owns outright is
+    # the honest shape anyway, since decode is what this measures.
+    vae = _load_vae(args.model, device=_device(), dtype=torch.bfloat16)
+    latent_mean, latent_std = _latent_stats(vae)
+
+    def to_model_space(output):
+        """Pull the tick's latents out and undo the checkpoint's normalisation.
+
+        A tick returns an ``OmniRequestOutput``; what the pipeline built is
+        under ``multimodal_output``. The latents are in the model's normalised
+        space, so they need the same inverse the pipeline applies before its
+        own decode, or the decoder sees values it was never trained on.
+        """
+        latents = _tick_latents(output)
+        return (latents.to(vae.device) * latent_std + latent_mean).to(dtype=vae.dtype)
+
+    decoder = WanStreamingDecoder(vae)
     inner = await backend.manager.create_session(label)
     session = DecodingSession(
         inner=inner,
         decoder=decoder,
         session_id=label,
-        latent_of=lambda output: output["payload"]["latents"],
+        latent_of=to_model_space,
     )
 
     clips = []

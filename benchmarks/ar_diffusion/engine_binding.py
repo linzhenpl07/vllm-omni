@@ -83,12 +83,13 @@ async def build_realtime_backend(args: argparse.Namespace) -> RealtimeBackend:
 
 
 def _declared_spec(engine: Any) -> Any:
-    """Fetch the pipeline's declared AR-Diffusion KV spec from the engine."""
+    """Fetch the pipeline's declared AR-Diffusion KV spec, or None.
+
+    Returns None rather than raising, because the pipeline lives in the worker
+    process and an engine built with process isolation cannot reach it from
+    here. Only callers that need the chunk shape -- the load benchmark, to
+    build its playout grid -- have to care; driving sessions does not.
+    """
     pipeline = getattr(getattr(engine, "engine", None), "pipeline", None)
     spec_fn = getattr(pipeline, "ar_diffusion_kv_cache_spec", None)
-    if spec_fn is None:
-        raise RuntimeError(
-            "The selected model does not implement SupportsARDiffusionPipeline, "
-            "so its chunk shape and session capacity are not declared."
-        )
-    return spec_fn()
+    return None if spec_fn is None else spec_fn()

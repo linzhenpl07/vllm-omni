@@ -40,18 +40,24 @@ async def build_realtime_backend(args: argparse.Namespace) -> RealtimeBackend:
     )
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    # Resolution and any other pipeline-level knob arrive through model_config,
+    # which is an engine construction parameter -- changing one means a new
+    # engine, not a new request.
+    model_config: dict[str, Any] = {
+        "ar_diffusion_kv_config": {
+            "gpu_memory_fraction": args.gpu_memory_fraction,
+            "warmup_cudagraph": not args.enforce_eager,
+        },
+    }
+    model_config.update(getattr(args, "model_config_overrides", None) or {})
+
     engine = AsyncOmni(
         model=args.model,
         engine_backend="vllm_omni.experimental.ar_diffusion.engine.ARDiffusionEngine",
         enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=1,
-        model_config={
-            "ar_diffusion_kv_config": {
-                "gpu_memory_fraction": args.gpu_memory_fraction,
-                "warmup_cudagraph": not args.enforce_eager,
-            },
-        },
+        model_config=model_config,
     )
 
     sampling = OmniDiffusionSamplingParams(seed=args.seed, output_type="latent")

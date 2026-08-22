@@ -136,8 +136,54 @@ in aggregate FPS is per-tick switching cost — state bind/unbind, KV pool pagin
 conditioning rebuild — and that number is the baseline any cross-session
 batching work has to beat.
 
+## Quality across resolutions
+
+Latency here scales steeply with tokens per frame, so lowering resolution is the
+only lever that reaches realtime. Whether it may be pulled is a question about
+pixels, and `run_quality_vs_resolution.py` answers it:
+
+```bash
+# Needs a device: one engine per resolution, since resolution is a
+# construction parameter. Writes PNG frames and a manifest per run.
+python -m benchmarks.ar_diffusion.run_quality_vs_resolution generate \
+    --model <checkpoint> --prompt "..." --image first.png \
+    --out runs/quality --chunks 8 \
+    --resolution 832x480 --resolution 512x320 --resolution 384x288 \
+    --note "hw=1xRTX-PRO-6000" --note "steps=4"
+
+# Needs nothing. Re-runnable after installing LPIPS, or on another machine.
+python -m benchmarks.ar_diffusion.run_quality_vs_resolution compare \
+    --reference runs/quality/832x480_seed0 \
+    --candidate runs/quality/512x320_seed0 \
+    --candidate runs/quality/384x288_seed0 \
+    --floor runs/quality/832x480_seed1
+```
+
+### Why a distance alone is not a quality number
+
+The same seed at two resolutions does not give the same video at two qualities.
+The noise tensor has a different shape, the trajectory diverges, and the clips
+show different content. A paired metric between them measures content divergence
+*plus* quality loss.
+
+So every comparison is read against a **divergence floor**: the reference
+resolution against itself at a different seed, which is two different videos at
+identical quality. A cross-resolution distance means something only if it is
+worse than that. Without a floor, `compare` prints the distances but refuses to
+call them quality.
+
+Expect PSNR and SSIM to under-resolve — they compare pixels that were never
+meant to line up, and stay inside the floor through degradation a viewer would
+call obvious. Sharpness needs no counterpart frame and separates a blurred clip
+from a merely different one far more reliably; it is measured at the reference
+size, because per-pixel Laplacian variance would otherwise rank a downscaled
+clip *above* the clip it came from. None of this replaces looking at the frames,
+which is why they are written to disk.
+
 ## Tests
 
 `tests/diffusion/ar_diffusion/test_realtime_benchmark.py` drives the whole load
 model on a virtual clock against fake sessions: CPU only, no engine, no device,
-no checkpoint. `engine_binding.py` is the only module not covered.
+no checkpoint. `tests/diffusion/ar_diffusion/test_quality_metrics.py` covers the
+metrics and the reporting rules the same way. `engine_binding.py` and the
+`generate` subcommand are the only parts not covered.

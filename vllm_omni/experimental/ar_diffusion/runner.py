@@ -31,6 +31,33 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+# FlashAttention's paged kernel accepts only block sizes that are multiples of
+# 16 (`vllm/v1/attention/backends/flash_attn.py`, get_supported_kernel_block_sizes).
+KERNEL_BLOCK_MULTIPLE = 16
+
+
+def paging_block_size(tokens_per_frame: int) -> int:
+    """Choose the paging unit, which is not the eviction unit.
+
+    AR-Diffusion evicts by frame; the attention kernel tiles by a fixed number
+    of tokens. Using the frame as the block binds every output resolution to
+    that kernel constraint, so the resolutions that run today do so by
+    arithmetic accident -- and the LingBot World v2 checkpoint's own default
+    832x480 is not one of them:
+
+        (480/16) x (832/16) = 30 x 52 = 1560 tokens per frame, 1560 % 16 = 8
+
+    A frame that is already a legal block stays one, so every resolution that
+    works today keeps precisely the paging it has now. Anything else pages at
+    the finest legal unit, which costs a longer block table and gives back the
+    rounding waste of a block one whole frame wide -- at 832x480 that block is
+    over a gigabyte.
+    """
+    if tokens_per_frame % KERNEL_BLOCK_MULTIPLE == 0:
+        return tokens_per_frame
+    return KERNEL_BLOCK_MULTIPLE
+
+
 def resolve_ar_diffusion_kv_config(od_config: OmniDiffusionConfig) -> ARDiffusionKVConfig:
     """Resolve optional deployment overrides and enable AR-Diffusion KV."""
     raw = getattr(od_config, "ar_diffusion_kv_config", None)
@@ -138,7 +165,7 @@ class ARDiffusionModelRunner(DiffusionModelRunner):
             num_kv_heads=spec.num_kv_heads,
             head_size=spec.head_size,
             dtype=self.od_config.dtype,
-            block_size=spec.tokens_per_frame,
+            block_size=paging_block_size(spec.tokens_per_frame),
             max_model_len=spec.max_model_len,
             available_bytes=self._available_memory_bytes() if available_bytes is None else available_bytes,
             kv_branches=spec.kv_branches,

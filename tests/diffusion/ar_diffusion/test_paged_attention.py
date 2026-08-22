@@ -37,8 +37,21 @@ POS = "positive"
 NEG = "negative"
 
 
-def make_state(*, num_layers=1, window_chunks=2, dtype=torch.float32, device=torch.device("cpu")):
-    cfg = ARDiffusionKVConfig(enable=True, chunk_size=BLOCK, window_chunks=window_chunks)
+def make_state(
+    *,
+    num_layers=1,
+    window_chunks=2,
+    chunk_size=BLOCK,
+    sink_chunks=0,
+    dtype=torch.float32,
+    device=torch.device("cpu"),
+):
+    """Build a cache. ``chunk_size`` defaults to the block size, but the two are
+    independent -- the shipped 832x480 gives 1560 tokens per frame against
+    16-token blocks, so a frame is 97.5 blocks."""
+    cfg = ARDiffusionKVConfig(
+        enable=True, chunk_size=chunk_size, window_chunks=window_chunks, sink_chunks=sink_chunks
+    )
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -107,11 +120,13 @@ def _commit_video_span(
     n_chunks: int,
     dtype: torch.dtype,
     device: torch.device,
+    chunk_size: int = BLOCK,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    ctx = st.get_kv_caches(kv_branch, seq_len=n_chunks * BLOCK, commit_current=True)[0].forward_ctx
+    span = n_chunks * chunk_size
+    ctx = st.get_kv_caches(kv_branch, seq_len=span, commit_current=True)[0].forward_ctx
     ctx.ensure_video_slots(device)
-    k = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
-    v = torch.randn(1, n_chunks * BLOCK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    k = torch.randn(1, span, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(1, span, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
     kv._k_pools[0][ctx.current_video_slot_mapping] = k[0]
     kv._v_pools[0][ctx.current_video_slot_mapping] = v[0]
     st.commit_paged_context(kv_branch)
@@ -969,3 +984,233 @@ def test_reserving_more_slots_costs_proportionally_more_scratch():
 
     assert three.scratch_blocks_per_slot == one.scratch_blocks_per_slot
     assert three.scratch_num_blocks == 3 * one.scratch_num_blocks
+
+
+# ── a frame that is not a whole number of blocks ────────────────────────────
+
+# 24 tokens per chunk against 16-token blocks leaves 8 over, the same remainder
+# the shipped 832x480 produces (1560 % 16 == 8). Every fixture above holds
+# chunk_size == BLOCK, so nothing there can reach this path.
+RAGGED_CHUNK = 24
+
+
+@pytest.mark.parametrize("commit_current", [False, True])
+@pytest.mark.parametrize("action_len", [0, 3])
+def test_a_ragged_chunk_still_matches_the_dense_reference(commit_current, action_len):
+    """Attention reads a sequence, not a set of blocks.
+
+    With one committed chunk of 24 tokens the history stops 8 slots into its
+    last block. The committing path writes straight after it and is fine. The
+    scratch path used to restart at slot zero of a fresh region, which left
+    those 8 slots unwritten -- and since the kernel consumes the block table as
+    one contiguous run, it read them as if they were tokens and shifted every
+    token after them by 8. Shapes stayed correct throughout, so only the values
+    showed it.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    dtype = torch.float32
+    # window_chunks=2 with one chunk of history keeps the whole sequence
+    # resident, so the window does not also round up here; that case is
+    # test_a_ragged_window_keeps_the_block_table_a_fixed_shape below.
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2, chunk_size=RAGGED_CHUNK)
+
+    history_k, history_v = _commit_video_span(
+        kv, st, kv_branch=POS, n_chunks=1, dtype=dtype, device=device, chunk_size=RAGGED_CHUNK
+    )
+
+    ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=commit_current)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+    assert ctx.start_offset == RAGGED_CHUNK % BLOCK == 8
+
+    current_k = torch.randn(1, RAGGED_CHUNK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    current_v = torch.randn(1, RAGGED_CHUNK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    kv._k_pools[0][ctx.current_video_slot_mapping] = current_k[0]
+    kv._v_pools[0][ctx.current_video_slot_mapping] = current_v[0]
+
+    action_k = action_v = None
+    if action_len:
+        ctx.ensure_action_slots(action_len, device)
+        action_k = torch.randn(1, action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+        action_v = torch.randn(1, action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+        kv._k_pools[0][ctx.action_slot_mapping] = action_k[0]
+        kv._v_pools[0][ctx.action_slot_mapping] = action_v[0]
+
+    query = torch.randn(1, RAGGED_CHUNK + action_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    block_table, query_start_loc, seq_lens, max_query_len, max_seq_len = ctx.build_block_table(
+        action_len=action_len, query_len=query.shape[1], device=device
+    )
+    paged = ar_diffusion_paged_attention(
+        query,
+        kv.key_cache(0),
+        kv.value_cache(0),
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        softmax_scale=HEAD_DIM**-0.5,
+        causal=False,
+    )
+
+    new_k = torch.cat([history_k, current_k], dim=1)
+    new_v = torch.cat([history_v, current_v], dim=1)
+    if action_len:
+        new_k = torch.cat([new_k, action_k], dim=1)
+        new_v = torch.cat([new_v, action_v], dim=1)
+    ref = _dense_attention(query, new_k, new_v)
+
+    torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)
+
+
+def test_a_ragged_scratch_chunk_is_physically_continuous_with_its_history():
+    """The write targets themselves must leave no hole.
+
+    This is the property the values above depend on, asserted directly so a
+    regression names the cause rather than showing a numeric mismatch.
+    """
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, window_chunks=2, chunk_size=RAGGED_CHUNK)
+    _commit_video_span(
+        kv, st, kv_branch=POS, n_chunks=1, dtype=torch.float32, device=device, chunk_size=RAGGED_CHUNK
+    )
+
+    ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=False)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+
+    history_tail_block = ctx.history_block_ids[-1]
+    # The chunk starts inside the history's own last block, not at a fresh one.
+    assert ctx.current_video_block_ids[0] == history_tail_block
+    first_slot = int(ctx.current_video_slot_mapping[0])
+    assert first_slot == history_tail_block * BLOCK + 8
+
+    # And the action region must not be charged for that managed block.
+    ctx.ensure_action_slots(3, device)
+    assert ctx._scratch_blocks_used == len(ctx.current_video_block_ids) - 1
+    assert ctx.action_scratch_block_ids[0] not in ctx.current_video_block_ids
+
+
+def test_a_ragged_window_keeps_the_block_table_a_fixed_shape():
+    """The table's shape must not track how full the window is.
+
+    With a sink the visible window is 2*24 + 24 = 72 tokens, which is 4.5
+    blocks. Deriving the width by flooring that would understate the capacity,
+    the max() against the live block count would take over, and the shape would
+    change as the window filled -- recompiling the graph. The same floor would
+    also let max_seq_len come out under the kv_len actually passed.
+    """
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, window_chunks=2, sink_chunks=1, chunk_size=RAGGED_CHUNK)
+    # The window is deliberately not a whole number of blocks.
+    max_video_tokens = kv.spec.sliding_window + kv.spec.sink_chunks * kv.spec.chunk_size
+    assert max_video_tokens % BLOCK != 0
+
+    widths: set[int] = set()
+    kv_lens: list[int] = []
+    for _ in range(6):
+        ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(device)
+        block_table, _, seq_lens, _, max_seq_len = ctx.build_block_table(
+            action_len=0, query_len=RAGGED_CHUNK, device=device
+        )
+        widths.add(int(block_table.shape[1]))
+        # A bound handed to the kernel has to actually bound the sequence.
+        assert int(seq_lens[0]) <= max_seq_len
+        kv_lens.append(int(seq_lens[0]))
+        st.commit_paged_context(POS)
+
+    assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
+    # The window has to have actually filled, or none of the above was tested.
+    assert max(kv_lens) > min(kv_lens)
+    # Rounding up keeps at most one block more than the token window asks for.
+    assert max(kv_lens) <= ctx.max_video_blocks * BLOCK
+    assert max(kv_lens) < max_video_tokens + BLOCK
+
+
+def test_the_checkpoints_own_default_resolution_can_build_a_cache():
+    """832x480 is what LingBot World v2 ships as its default, and it could not run.
+
+    A frame-sized block made the resolution a kernel-compatibility question:
+    1560 tokens per frame is not a multiple of 16, so FlashAttention's paged
+    kernel rejected it and the default resolution had no realtime path at all.
+    """
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    tokens_per_frame = (480 // 16) * (832 // 16)
+    assert tokens_per_frame == 1560
+    assert tokens_per_frame % 16 == 8, "the whole point is that a frame is not a legal block"
+
+    block_size = paging_block_size(tokens_per_frame)
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=tokens_per_frame, window_chunks=2)
+    kv = ARDiffusionKVCache(
+        cfg,
+        num_layers=1,
+        num_kv_heads=N_HEADS,
+        head_size=HEAD_DIM,
+        dtype=torch.float32,
+        block_size=block_size,
+        max_model_len=1 << 16,
+        available_bytes=1 << 28,
+        kv_branches=(ARDiffusionKVBranchSpec(POS, 0),),
+        session_capacity=1,
+        frames_per_block=2,
+        max_scratch_tokens_per_branch=block_size,
+        device=torch.device("cpu"),
+    )
+
+    assert kv.block_size % 16 == 0
+    # The eviction unit is still the frame; only the paging unit changed.
+    assert kv.spec.chunk_size == tokens_per_frame
+    assert kv.blocks_per_frame == -(-tokens_per_frame // block_size) == 98
+
+
+def test_the_shipped_resolution_geometry_matches_dense_attention():
+    """The real number, not a scaled-down stand-in: 1560 tokens per frame.
+
+    This is the case the issue reported failing at ~4e-02 on the scratch path.
+    It runs on CPU because the reference is dense attention, not a kernel.
+    """
+    torch.manual_seed(0)
+    device = torch.device("cpu")
+    dtype = torch.float32
+    tokens_per_frame = (480 // 16) * (832 // 16)
+    assert tokens_per_frame == 1560
+
+    kv, st = make_state(dtype=dtype, device=device, window_chunks=2, chunk_size=tokens_per_frame)
+    history_k, history_v = _commit_video_span(
+        kv, st, kv_branch=POS, n_chunks=1, dtype=dtype, device=device, chunk_size=tokens_per_frame
+    )
+
+    # The non-committing path is the one that was wrong: four of the five
+    # forwards per generated block take it.
+    ctx = st.get_kv_caches(POS, seq_len=tokens_per_frame, commit_current=False)[0].forward_ctx
+    ctx.ensure_video_slots(device)
+    assert ctx.start_offset == 8, "1560 % 16 == 8 is the whole reason this case exists"
+
+    current_k = torch.randn(1, tokens_per_frame, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    current_v = torch.randn(1, tokens_per_frame, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    kv._k_pools[0][ctx.current_video_slot_mapping] = current_k[0]
+    kv._v_pools[0][ctx.current_video_slot_mapping] = current_v[0]
+
+    query = torch.randn(1, tokens_per_frame, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    block_table, query_start_loc, seq_lens, max_query_len, max_seq_len = ctx.build_block_table(
+        action_len=0, query_len=tokens_per_frame, device=device
+    )
+    paged = ar_diffusion_paged_attention(
+        query,
+        kv.key_cache(0),
+        kv.value_cache(0),
+        block_table=block_table,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        max_query_len=max_query_len,
+        max_seq_len=max_seq_len,
+        softmax_scale=HEAD_DIM**-0.5,
+        causal=False,
+    )
+    ref = _dense_attention(
+        query,
+        torch.cat([history_k, current_k], dim=1),
+        torch.cat([history_v, current_v], dim=1),
+    )
+    torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5)

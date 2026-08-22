@@ -370,10 +370,17 @@ def test_lru_eviction_releases_blocks_and_notifies_pipeline():
 
 def test_budget_reduced_capacity_drives_runner_lru():
     pipeline = CapablePipeline(tiny_spec(capacity=2))
-    # One tiny LingBot-like session requires 128 bytes; two require 192.
+    # One tiny LingBot-like session requires 1,808 bytes; two require 2,592.
+    #
+    # These read 128 and 192 while the paging unit was the frame. tiny_spec
+    # declares one token per frame, so it used to page a single token at a
+    # time -- a block size no attention kernel accepts. Paging at 16 makes
+    # each page sixteen times larger. The block *counts* are unchanged, and
+    # so is what this test is about: a budget that fits fewer sessions than
+    # the pipeline asked for must drive the runner's LRU.
     runner = make_runner(
         pipeline,
-        available_bytes=128,
+        available_bytes=2048,
         gpu_memory_fraction=1.0,
     )
     kv = runner.kv_cache
@@ -659,3 +666,30 @@ def test_pipeline_without_warmup_provider_is_safely_skipped(monkeypatch):
     monkeypatch.setattr(runner, "execute_model", fail_if_called)
     runner._warmup_ar_rollout()
     assert execute.called is False
+
+
+# ── paging unit vs eviction unit ────────────────────────────────────────────
+
+
+def test_a_frame_that_is_already_a_legal_block_keeps_its_paging():
+    """Every resolution that runs today must page exactly as it does today."""
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    for tokens_per_frame in (16, 320, 1440, 4096):
+        assert tokens_per_frame % 16 == 0
+        assert paging_block_size(tokens_per_frame) == tokens_per_frame
+
+
+def test_a_frame_the_kernel_would_reject_pages_at_the_finest_legal_unit():
+    """832x480 is the checkpoint's own default and the kernel rejects it.
+
+    (480/16) x (832/16) = 1560 tokens per frame, and 1560 % 16 == 8, so a
+    frame-sized block is not something FlashAttention's paged kernel accepts.
+    """
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    assert 1560 % 16 == 8
+    assert paging_block_size(1560) == 16
+    # And whatever it returns is always something the kernel takes.
+    for tokens_per_frame in range(1, 200):
+        assert paging_block_size(tokens_per_frame) % 16 == 0

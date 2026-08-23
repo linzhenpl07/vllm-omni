@@ -1941,3 +1941,180 @@ def test_the_early_ticks_are_unchanged_by_the_shorter_encode(
     assert seen["4"] == 9 and seen["20"] == 24
     for early, late in zip(short, long, strict=True):
         torch.testing.assert_close(early, late)
+
+
+def _settling_condition_pipeline(module, monkeypatch, onset, *, horizon_frames=30):
+    """A pipeline whose _prepare_condition returns a condition that settles."""
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    encodes: list[int] = []
+
+    def prepare(inputs, *, dtype):
+        encodes.append(inputs.num_latent_frames)
+        torch.manual_seed(7)
+        settled = torch.randn(1, 20, 3, 2, 2)
+        frames = []
+        for index in range(inputs.num_latent_frames):
+            if index < onset:
+                frames.append(torch.randn(1, 20, 1, 2, 2))
+            else:
+                column = (index - onset) % 3
+                frames.append(settled[:, :, column : column + 1])
+        return torch.cat(frames, dim=2).to(dtype=dtype)
+
+    monkeypatch.setattr(pipeline, "_prepare_condition", prepare)
+    monkeypatch.setattr(pipeline, "_ar_text_caches", lambda *a, **k: [SimpleNamespace()])
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_block",
+        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+    )
+    return pipeline, encodes
+
+
+def test_the_onset_is_read_off_the_first_encode_rather_than_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Nobody has to supply the number, and nobody has to guess it."""
+    module = _load_pipeline_module()
+    pipeline, encodes = _settling_condition_pipeline(module, monkeypatch, onset=5)
+
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+
+    # The first session pays for the horizon, exactly as before.
+    assert encodes == [30]
+    assert pipeline._measured_condition_onset == 5
+    # And keeps only the transient plus one block, rounded to whole blocks.
+    assert pipeline._ar_sessions["world-1"].image_condition.shape[2] == 9
+
+
+def test_later_sessions_encode_only_what_the_measurement_showed_matters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline, encodes = _settling_condition_pipeline(module, monkeypatch, onset=5)
+
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+    pipeline._ar_sessions.clear()
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+
+    assert encodes == [30, 9]
+
+
+def test_a_condition_that_never_settles_keeps_the_horizon_and_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusing beats feeding the model a block that was never shown to repeat."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+
+    def never_settles(inputs, *, dtype):
+        torch.manual_seed(3)
+        return torch.randn(1, 20, inputs.num_latent_frames, 2, 2).to(dtype=dtype)
+
+    monkeypatch.setattr(pipeline, "_prepare_condition", never_settles)
+    monkeypatch.setattr(pipeline, "_ar_text_caches", lambda *a, **k: [SimpleNamespace()])
+    monkeypatch.setattr(
+        pipeline,
+        "_generate_block",
+        lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+    )
+
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+    assert pipeline._condition_onset_measured
+    assert pipeline._measured_condition_onset is None
+    assert pipeline._ar_sessions["world-1"].image_condition.shape[2] == 30
+
+    pipeline._ar_sessions["world-1"].next_chunk_index = 10
+    with pytest.raises(ValueError, match=r"at most 10 ticks"):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=10))))
+
+
+def test_the_kept_condition_does_not_hold_the_horizon_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slice is a view: keeping one keeps the whole allocation it came from.
+
+    The point of the change is the bytes a session holds, so the trimmed
+    condition has to own its own storage.
+    """
+    module = _load_pipeline_module()
+    pipeline, _ = _settling_condition_pipeline(module, monkeypatch, onset=5)
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+
+    held = pipeline._ar_sessions["world-1"].image_condition
+    assert held.shape[2] == 9
+    assert held.untyped_storage().size() == held.numel() * held.element_size()
+
+
+def test_an_explicit_setting_skips_the_measurement_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_pipeline_module()
+    pipeline, encodes = _settling_condition_pipeline(module, monkeypatch, onset=5)
+    pipeline.condition_steady_state_latent_frames = 4
+
+    pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+
+    assert encodes == [9]
+    assert not pipeline._condition_onset_measured
+
+
+def test_a_condition_that_only_nearly_repeats_is_not_settled_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real VAE decays to about 2.5e-4 of maximum and stops there.
+
+    Exact equality is the default precisely because "almost repeats" is a
+    judgement about the video, and making it silently is how a horizon gets
+    unbounded at the cost of a condition nobody agreed to.
+    """
+    module = _load_pipeline_module()
+
+    def nearly(inputs, *, dtype):
+        torch.manual_seed(11)
+        settled = torch.randn(1, 20, 3, 2, 2)
+        frames = []
+        for index in range(inputs.num_latent_frames):
+            column = index % 3
+            drift = 2.5e-4 * settled.abs().max() * (1 if index % 2 else -1)
+            frames.append(settled[:, :, column : column + 1] + drift)
+        return torch.cat(frames, dim=2).to(dtype=dtype)
+
+    def build(atol):
+        pipeline = _pipeline(module)
+        pipeline._ar_height = 16
+        pipeline._ar_width = 16
+        pipeline._ar_diffusion_kv_state = object()
+        pipeline.condition_steady_state_atol = atol
+        monkeypatch.setattr(pipeline, "_prepare_condition", nearly)
+        monkeypatch.setattr(pipeline, "_ar_text_caches", lambda *a, **k: [SimpleNamespace()])
+        monkeypatch.setattr(
+            pipeline,
+            "_generate_block",
+            lambda **kwargs: torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"]),
+        )
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))
+        return pipeline
+
+    exact = build(0.0)
+    assert exact._condition_onset_measured
+    assert exact._measured_condition_onset is None
+    assert exact._ar_sessions["world-1"].image_condition.shape[2] == 30
+
+    tolerant = build(1e-3)
+    assert tolerant._measured_condition_onset == 0
+    assert tolerant._ar_sessions["world-1"].image_condition.shape[2] == 3
+
+
+def test_a_negative_tolerance_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_pipeline_module()
+    pipeline, _ = _settling_condition_pipeline(module, monkeypatch, onset=5)
+    pipeline.condition_steady_state_atol = -1e-6
+    with pytest.raises(ValueError, match="must not be negative"):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=0))))

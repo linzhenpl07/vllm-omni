@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Tests for AR-Diffusion paged self-attention contexts."""
 
 from __future__ import annotations
@@ -49,9 +50,7 @@ def make_state(
     """Build a cache. ``chunk_size`` defaults to the block size, but the two are
     independent -- the shipped 832x480 gives 1560 tokens per frame against
     16-token blocks, so a frame is 97.5 blocks."""
-    cfg = ARDiffusionKVConfig(
-        enable=True, chunk_size=chunk_size, window_chunks=window_chunks, sink_chunks=sink_chunks
-    )
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=chunk_size, window_chunks=window_chunks, sink_chunks=sink_chunks)
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -1071,9 +1070,7 @@ def test_a_ragged_scratch_chunk_is_physically_continuous_with_its_history():
     """
     device = torch.device("cpu")
     kv, st = make_state(device=device, window_chunks=2, chunk_size=RAGGED_CHUNK)
-    _commit_video_span(
-        kv, st, kv_branch=POS, n_chunks=1, dtype=torch.float32, device=device, chunk_size=RAGGED_CHUNK
-    )
+    _commit_video_span(kv, st, kv_branch=POS, n_chunks=1, dtype=torch.float32, device=device, chunk_size=RAGGED_CHUNK)
 
     ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=False)[0].forward_ctx
     ctx.ensure_video_slots(device)

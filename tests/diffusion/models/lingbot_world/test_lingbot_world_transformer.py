@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -683,3 +683,169 @@ def test_official_default_shapes_match_public_safetensors_header_fixture() -> No
         shape, dtype = parameter_specs[name]
         assert tuple(shape) == tuple(expected_shape), name
         assert dtype == expected_dtype
+
+
+def _spatial_rope_model(module, *, reference_height=None, reference_width=None):
+    """A model whose spatial RoPE axes are non-empty.
+
+    ``_tiny_model`` uses ``attention_head_dim=2``, which makes
+    ``2 * (2 // 6) == 0`` -- both spatial axes are zero-width there, so nothing
+    about spatial positions is observable. Twelve gives four dims per axis.
+    """
+    return module.CausalLingBotWorldTransformer3DModel(
+        patch_size=(1, 2, 2),
+        num_attention_heads=2,
+        attention_head_dim=12,
+        in_channels=36,
+        out_channels=2,
+        text_dim=6,
+        freq_dim=4,
+        ffn_dim=8,
+        num_layers=1,
+        cross_attn_norm=True,
+        eps=1e-6,
+        rope_max_seq_len=64,
+        rope_reference_height=reference_height,
+        rope_reference_width=reference_width,
+        sink_size=1,
+        num_frames_per_block=1,
+        sliding_window_num_frames=3,
+        local_attn_size=-1,
+    )
+
+
+def test_a_grid_without_a_reference_keeps_the_integer_positions_it_always_had() -> None:
+    module = attention_tests._load_module()
+    model = _spatial_rope_model(module)
+
+    for axis in ("height", "width"):
+        cosine, sine = model._spatial_rope(axis, 5)
+        assert torch.equal(cosine, getattr(model, f"_rope_{axis}_cosine")[:5])
+        assert torch.equal(sine, getattr(model, f"_rope_{axis}_sine")[:5])
+
+
+def test_a_grid_that_equals_its_reference_is_unchanged_by_it() -> None:
+    """Setting a reference must cost nothing at the size it names."""
+
+    module = attention_tests._load_module()
+    plain = _spatial_rope_model(module)
+    referenced = _spatial_rope_model(module, reference_height=8, reference_width=8)
+
+    for axis in ("height", "width"):
+        expected = plain._spatial_rope(axis, 8)
+        actual = referenced._spatial_rope(axis, 8)
+        assert torch.equal(actual[0], expected[0])
+        assert torch.equal(actual[1], expected[1])
+
+
+def test_a_smaller_grid_spans_the_reference_instead_of_cropping_it() -> None:
+    """The whole point: four cells must reach position 7, not stop at 3.
+
+    Without a reference a four-row grid occupies rows 0..3 of an eight-row
+    frame, which is what makes the model draw the top half of a scene. With one
+    it occupies the full extent at coarser spacing, so the last row sits exactly
+    where the reference's last row does.
+    """
+
+    module = attention_tests._load_module()
+    plain = _spatial_rope_model(module)
+    referenced = _spatial_rope_model(module, reference_height=8)
+
+    cosine, sine = referenced._spatial_rope("height", 4)
+    assert cosine.shape[0] == 4
+
+    table_cosine = plain._rope_height_cosine
+    table_sine = plain._rope_height_sine
+    # First and last cells land on integer positions 0 and 7 exactly.
+    assert torch.allclose(cosine[0], table_cosine[0], atol=0, rtol=0)
+    assert torch.allclose(cosine[-1], table_cosine[7])
+    assert torch.allclose(sine[-1], table_sine[7])
+    # And it is not the un-referenced slice, which would stop at position 3.
+    assert not torch.allclose(cosine[-1], table_cosine[3])
+
+
+def test_the_two_spatial_axes_are_referenced_independently() -> None:
+    """Width compresses without visible damage where height does not, so a
+    deployment must be able to stretch one and leave the other alone."""
+
+    module = attention_tests._load_module()
+    plain = _spatial_rope_model(module)
+    model = _spatial_rope_model(module, reference_height=8)
+
+    height_cosine, _ = model._spatial_rope("height", 4)
+    width_cosine, _ = model._spatial_rope("width", 4)
+    assert not torch.equal(height_cosine, plain._rope_height_cosine[:4])
+    assert torch.equal(width_cosine, plain._rope_width_cosine[:4])
+
+
+def test_the_rotary_embedding_of_a_referenced_grid_differs_only_on_that_axis() -> None:
+    module = attention_tests._load_module()
+    plain = _spatial_rope_model(module)
+    model = _spatial_rope_model(module, reference_height=8)
+
+    kwargs = dict(frames=1, height=4, width=4, start_frame=0, dtype=torch.float32, device=torch.device("cpu"))
+    plain_cosine, _ = plain._rotary_embedding(**kwargs)
+    model_cosine, _ = model._rotary_embedding(**kwargs)
+
+    assert plain_cosine.shape == model_cosine.shape
+    # Each axis contributes dim/2 columns, not dim: a RoPE table holds one
+    # entry per frequency pair.
+    temporal_cols = plain._rope_axis_dims["temporal"] // 2
+    height_cols = plain._rope_axis_dims["height"] // 2
+    height_end = temporal_cols + height_cols
+
+    # Temporal and width spans are untouched; only the height span moves.
+    assert torch.equal(plain_cosine[:, :temporal_cols], model_cosine[:, :temporal_cols])
+    assert torch.equal(plain_cosine[:, height_end:], model_cosine[:, height_end:])
+    assert not torch.equal(
+        plain_cosine[:, temporal_cols:height_end],
+        model_cosine[:, temporal_cols:height_end],
+    )
+
+
+@pytest.mark.parametrize("value", [1, 0, -3, 2.5, True, "8"])
+def test_a_reference_that_cannot_name_positions_is_rejected(value: object) -> None:
+    module = attention_tests._load_module()
+    with pytest.raises(ValueError, match="rope_reference_height"):
+        _spatial_rope_model(module, reference_height=value)
+
+
+def test_a_reference_beyond_the_rope_table_is_rejected() -> None:
+    """65 positions cannot have been trained on a 64-position axis."""
+
+    module = attention_tests._load_module()
+    with pytest.raises(ValueError, match="exceeds rope_max_seq_len"):
+        _spatial_rope_model(module, reference_height=65)
+
+
+def test_from_config_carries_a_reference_without_treating_it_as_checkpoint_drift() -> None:
+    """The reference says how to serve a grid, not what the checkpoint holds, so
+    it must pass through the topology contract rather than trip it."""
+
+    module = attention_tests._load_module()
+
+    class ConfigProbe(module.CausalLingBotWorldTransformer3DModel):
+        def __init__(self, **kwargs) -> None:
+            self.received_kwargs = kwargs
+
+    config = {
+        "_class_name": "CausalLingBotWorldTransformer3DModel",
+        "patch_size": [1, 2, 2],
+        "rope_reference_height": 30,
+        "rope_reference_width": 52,
+    }
+    probe = ConfigProbe.from_config(config)
+    assert probe.received_kwargs["rope_reference_height"] == 30
+    assert probe.received_kwargs["rope_reference_width"] == 52
+
+
+def test_from_config_without_a_reference_leaves_it_unset() -> None:
+    module = attention_tests._load_module()
+
+    class ConfigProbe(module.CausalLingBotWorldTransformer3DModel):
+        def __init__(self, **kwargs) -> None:
+            self.received_kwargs = kwargs
+
+    probe = ConfigProbe.from_config({"_class_name": "CausalLingBotWorldTransformer3DModel"})
+    assert "rope_reference_height" not in probe.received_kwargs
+    assert "rope_reference_width" not in probe.received_kwargs

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Checkpoint-compatible causal DiT for the LingBot World v2 model package."""
 
 from __future__ import annotations
@@ -658,9 +658,16 @@ def _sinusoidal_embedding(dim: int, timestep: torch.Tensor) -> torch.Tensor:
     return torch.cat((phase.cos(), phase.sin()), dim=1)
 
 
-def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _rope_table(positions: torch.Tensor, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cosine and sine for one RoPE axis evaluated at ``positions``.
+
+    Positions are ordinarily the integers ``0..n-1``. They are a tensor rather
+    than a count because a grid smaller than the one the checkpoint was trained
+    at can be placed at fractional positions instead; see
+    :meth:`CausalLingBotWorldTransformer3DModel._spatial_rope`.
+    """
     if dim == 0:
-        empty = torch.empty(max_seq_len, 0, dtype=torch.float32)
+        empty = torch.empty(positions.numel(), 0, dtype=torch.float32)
         return empty, empty.clone()
     if dim % 2:
         raise ValueError(f"RoPE axis dimension must be even, got {dim}.")
@@ -668,8 +675,12 @@ def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
         10000,
         torch.arange(0, dim, 2, dtype=torch.float64) / dim,
     )
-    phase = torch.outer(torch.arange(max_seq_len, dtype=torch.float64), frequencies)
+    phase = torch.outer(positions.to(torch.float64), frequencies)
     return phase.cos().float(), phase.sin().float()
+
+
+def _rope_axis(max_seq_len: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return _rope_table(torch.arange(max_seq_len, dtype=torch.float64), dim)
 
 
 class CausalLingBotWorldTransformer3DModel(nn.Module):
@@ -695,6 +706,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         image_dim: int | None = None,
         added_kv_proj_dim: int | None = None,
         rope_max_seq_len: int = 1024,
+        rope_reference_height: int | None = None,
+        rope_reference_width: int | None = None,
         pos_embed_seq_len: int | None = None,
         qk_norm: str = "rms_norm_across_heads",
         sink_size: int = 9,
@@ -753,6 +766,8 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             image_dim=image_dim,
             added_kv_proj_dim=added_kv_proj_dim,
             rope_max_seq_len=rope_max_seq_len,
+            rope_reference_height=rope_reference_height,
+            rope_reference_width=rope_reference_width,
             pos_embed_seq_len=pos_embed_seq_len,
             qk_norm=qk_norm,
             sink_size=sink_size,
@@ -815,10 +830,24 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
 
         temporal_dim = attention_head_dim - 4 * (attention_head_dim // 6)
         height_dim = width_dim = 2 * (attention_head_dim // 6)
+        self._rope_axis_dims = {"temporal": temporal_dim, "height": height_dim, "width": width_dim}
         for axis, axis_dim in (("temporal", temporal_dim), ("height", height_dim), ("width", width_dim)):
             cosine, sine = _rope_axis(rope_max_seq_len, axis_dim)
             self.register_buffer(f"_rope_{axis}_cosine", cosine, persistent=False)
             self.register_buffer(f"_rope_{axis}_sine", sine, persistent=False)
+        for name, value in (("height", rope_reference_height), ("width", rope_reference_width)):
+            if value is None:
+                continue
+            if not isinstance(value, int) or isinstance(value, bool) or value < 2:
+                raise ValueError(f"rope_reference_{name} must be an integer of at least 2, got {value!r}.")
+            if value > rope_max_seq_len:
+                raise ValueError(
+                    f"rope_reference_{name}={value} exceeds rope_max_seq_len={rope_max_seq_len}; "
+                    "the reference names positions the model was trained to see."
+                )
+        # Built on first use and keyed by (axis, length): a reference is a
+        # serving choice, so the grid it will be asked for is not known here.
+        self._rope_reference_tables: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
 
     @property
     def dtype(self) -> torch.dtype:
@@ -868,6 +897,13 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             actual = kwargs.get(name, expected)
             if actual != expected:
                 raise ValueError(f"LingBot checkpoint config {name} must be {expected!r}, got {actual!r}.")
+        # Deliberately outside checkpoint_contract, and so exempt from the
+        # equality check above: these do not describe what the checkpoint
+        # contains, they describe where to place a grid smaller than the one it
+        # was trained on. A config that omits them serves exactly as before.
+        for name in ("rope_reference_height", "rope_reference_width"):
+            if name in config:
+                kwargs[name] = config[name]
         return cls(**kwargs, quant_config=quant_config, prefix=prefix)
 
     def allocate_cache(
@@ -916,6 +952,48 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
             dtype=dtype,
         )
 
+    def _spatial_rope(self, axis: str, length: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Cosine and sine for one spatial axis of a ``length``-cell grid.
+
+        Without a reference the grid sits at positions ``0..length-1``, which is
+        how this checkpoint has always been served. Those are absolute, so a
+        grid shorter than the one the checkpoint was trained on does not read as
+        the same picture sampled coarsely -- it reads as its first ``length``
+        rows. A 20-row grid asks for the top two thirds of a 30-row frame, and
+        the model obliges: sky and treetops, no ground.
+
+        A reference spreads the same ``length`` cells across the reference
+        extent instead, so the grid covers the full frame at a coarser spacing.
+        This is the position-interpolation trick from long-context language
+        models, applied to a grid that is smaller than trained rather than
+        longer.
+
+        ``rope_reference_height`` and ``rope_reference_width`` are separate
+        because the two axes do not fail alike: width compresses to 0.62 of the
+        reference with no visible damage, while height does not.
+        """
+
+        reference = getattr(self.config, f"rope_reference_{axis}")
+        cosine = getattr(self, f"_rope_{axis}_cosine")
+        sine = getattr(self, f"_rope_{axis}_sine")
+        if reference is None or length == reference:
+            # Byte-for-byte the pre-reference path. linspace over an unchanged
+            # extent would land on the same integers, but slicing says so.
+            return cosine[:length], sine[:length]
+        if length < 2:
+            raise ValueError(f"A {axis} reference needs at least two cells to interpolate, got {length}.")
+
+        key = (axis, length)
+        table = self._rope_reference_tables.get(key)
+        if table is None:
+            # Built on CPU in float64 like the registered buffers were, so a
+            # grid that happens to equal the reference matches them exactly.
+            positions = torch.linspace(0.0, float(reference - 1), length, dtype=torch.float64)
+            built_cosine, built_sine = _rope_table(positions, self._rope_axis_dims[axis])
+            table = (built_cosine.to(cosine.device), built_sine.to(sine.device))
+            self._rope_reference_tables[key] = table
+        return table
+
     def _rotary_embedding(
         self,
         *,
@@ -931,28 +1009,25 @@ class CausalLingBotWorldTransformer3DModel(nn.Module):
         if height > self.config.rope_max_seq_len or width > self.config.rope_max_seq_len:
             raise ValueError("Spatial RoPE positions exceed rope_max_seq_len.")
 
-        def expand_axis(table: torch.Tensor, axis: str) -> torch.Tensor:
-            if axis == "temporal":
-                return (
-                    table[start_frame : start_frame + frames].view(frames, 1, 1, -1).expand(frames, height, width, -1)
-                )
-            if axis == "height":
-                return table[:height].view(1, height, 1, -1).expand(frames, height, width, -1)
-            return table[:width].view(1, 1, width, -1).expand(frames, height, width, -1)
+        height_cosine, height_sine = self._spatial_rope("height", height)
+        width_cosine, width_sine = self._spatial_rope("width", width)
+
+        def expand_temporal(table: torch.Tensor) -> torch.Tensor:
+            return table[start_frame : start_frame + frames].view(frames, 1, 1, -1).expand(frames, height, width, -1)
 
         cosine = torch.cat(
             (
-                expand_axis(self._rope_temporal_cosine, "temporal"),
-                expand_axis(self._rope_height_cosine, "height"),
-                expand_axis(self._rope_width_cosine, "width"),
+                expand_temporal(self._rope_temporal_cosine),
+                height_cosine.view(1, height, 1, -1).expand(frames, height, width, -1),
+                width_cosine.view(1, 1, width, -1).expand(frames, height, width, -1),
             ),
             dim=-1,
         )
         sine = torch.cat(
             (
-                expand_axis(self._rope_temporal_sine, "temporal"),
-                expand_axis(self._rope_height_sine, "height"),
-                expand_axis(self._rope_width_sine, "width"),
+                expand_temporal(self._rope_temporal_sine),
+                height_sine.view(1, height, 1, -1).expand(frames, height, width, -1),
+                width_sine.view(1, 1, width, -1).expand(frames, height, width, -1),
             ),
             dim=-1,
         )

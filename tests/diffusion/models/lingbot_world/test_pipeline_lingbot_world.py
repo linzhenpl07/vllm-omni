@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from __future__ import annotations
 
@@ -1763,3 +1763,181 @@ def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> No
     assert "from .pipeline import" in lingbot_init
     assert '"LingBotWorldCausalDMDPipeline"' in lingbot_init
     assert '"CausalLingBotWorldTransformer3DModel"' in lingbot_init
+
+
+# ── a session's image condition need not grow with the session ──────────────
+
+
+def _constant_condition(module, frames, *, block_frames=3, onset=4, channels=20, size=2):
+    """A condition that moves for `onset` frames and is constant after."""
+    torch.manual_seed(0)
+    settled = torch.randn(1, channels, block_frames, size, size)
+    frames_list = []
+    for index in range(frames):
+        if index < onset:
+            frames_list.append(torch.randn(1, channels, 1, size, size))
+        else:
+            frames_list.append(settled[:, :, (index - onset) % block_frames : (index - onset) % block_frames + 1])
+    return torch.cat(frames_list, dim=2)
+
+
+def test_the_onset_is_measured_not_assumed() -> None:
+    """The number that makes the horizon unbounded has to come from the tensor."""
+    module = _load_pipeline_module()
+    condition = _constant_condition(module, frames=18, onset=6)
+    assert module.condition_steady_state_onset(condition, 3) == 6
+
+
+def test_a_condition_that_never_settles_reports_nothing_rather_than_a_number() -> None:
+    """An encode too short to show the settling must not be read as a settled one."""
+    module = _load_pipeline_module()
+    torch.manual_seed(1)
+    moving = torch.randn(1, 20, 12, 2, 2)
+    assert module.condition_steady_state_onset(moving, 3) is None
+
+
+def test_the_onset_is_the_first_settled_frame_not_merely_a_settled_one() -> None:
+    module = _load_pipeline_module()
+    condition = _constant_condition(module, frames=21, onset=3)
+    onset = module.condition_steady_state_onset(condition, 3)
+    assert onset == 3
+    assert module.condition_steady_state_onset(condition[:, :, onset:], 3) == 0
+
+
+def test_raw_frames_round_trip_through_the_causal_fold() -> None:
+    module = _load_pipeline_module()
+    for latent_frames in (1, 3, 6, 30):
+        raw = module.raw_frames_for_latent_frames(latent_frames, 4)
+        assert (raw - 1) // 4 + 1 == latent_frames
+    with pytest.raises(ValueError, match="at least 1"):
+        module.raw_frames_for_latent_frames(0, 4)
+
+
+def test_without_a_measured_onset_the_condition_still_spans_the_whole_horizon() -> None:
+    """The conservative default: unchanged encode, unchanged accounting."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    assert pipeline.condition_steady_state_latent_frames is None
+    assert pipeline._condition_latent_frames() == (117 - 1) // 4 + 1 == 30
+
+
+def test_a_measured_onset_shrinks_what_a_session_holds_to_a_constant() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline.condition_steady_state_latent_frames = 4
+    # 4 transient frames plus one 3-frame block, rounded up to whole blocks.
+    assert pipeline._condition_latent_frames() == 9
+    # An onset of 1 still needs six: the reused block has to start on a block
+    # boundary at or after the onset, and the first such boundary is frame 3.
+    pipeline.condition_steady_state_latent_frames = 1
+    assert pipeline._condition_latent_frames() == 6
+
+
+def test_an_onset_past_the_horizon_cannot_ask_for_more_than_the_horizon() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline.condition_steady_state_latent_frames = 999
+    assert pipeline._condition_latent_frames() == 30
+
+
+def test_a_negative_onset_is_rejected_rather_than_wrapped() -> None:
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline.condition_steady_state_latent_frames = -1
+    with pytest.raises(ValueError, match="must not be negative"):
+        pipeline._condition_latent_frames()
+
+
+def test_the_ten_tick_ceiling_is_gone_once_the_onset_is_known(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tick 10 is an error today only because of what this pipeline preallocates.
+
+    The transformer never learns how long a session is -- it sees a fixed-width
+    slice each tick -- so once the condition is known to have settled there is
+    nothing left to run out of.
+    """
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    pipeline.condition_steady_state_latent_frames = 4
+    pipeline._ar_sessions["world-1"] = module._LingBotARSessionState(next_chunk_index=10)
+
+    conditions = []
+
+    def generate_block(**kwargs):
+        conditions.append(kwargs["condition"].clone())
+        return torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"])
+
+    monkeypatch.setattr(pipeline, "_ar_text_caches", lambda *a, **k: [SimpleNamespace()])
+    monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+
+    for chunk_index in (10, 11, 40):
+        pipeline._ar_sessions["world-1"].next_chunk_index = chunk_index
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+
+    assert len(conditions) == 3
+    # Every tick past the transient receives the same settled block, which is
+    # what makes the per-session cost constant.
+    torch.testing.assert_close(conditions[0], conditions[1])
+    torch.testing.assert_close(conditions[0], conditions[2])
+    assert pipeline._ar_sessions["world-1"].image_condition.shape[2] == 9
+
+
+def test_the_ceiling_still_stands_while_the_onset_is_unmeasured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Refusing is better than silently feeding a condition nobody has checked."""
+    module = _load_pipeline_module()
+    pipeline = _pipeline(module)
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    pipeline._ar_diffusion_kv_state = object()
+    assert pipeline.condition_steady_state_latent_frames is None
+    pipeline._ar_sessions["world-1"] = module._LingBotARSessionState(next_chunk_index=10)
+    monkeypatch.setattr(
+        pipeline,
+        "encode_prompt",
+        lambda *args, **kwargs: pytest.fail("the horizon must be validated before prompt encoding"),
+    )
+    with pytest.raises(ValueError, match=r"at most 10 ticks"):
+        pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=10))))
+
+
+def test_the_early_ticks_are_unchanged_by_the_shorter_encode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The VAE is causal, so a prefix encode reproduces the horizon's prefix.
+
+    This is what makes shortening the encode safe at all; only the reuse past
+    the prefix rests on the measured onset.
+    """
+    module = _load_pipeline_module()
+    seen: dict[str, int] = {}
+
+    def run(onset):
+        pipeline = _pipeline(module)
+        pipeline._ar_height = 16
+        pipeline._ar_width = 16
+        pipeline._ar_diffusion_kv_state = object()
+        pipeline.condition_steady_state_latent_frames = onset
+        captured = []
+
+        def generate_block(**kwargs):
+            captured.append(kwargs["condition"].clone())
+            return torch.randn((1, 16, 3, 2, 2), generator=kwargs["generator"])
+
+        monkeypatch.setattr(pipeline, "_ar_text_caches", lambda *a, **k: [SimpleNamespace()])
+        monkeypatch.setattr(pipeline, "_generate_block", generate_block)
+        for chunk_index in (0, 1):
+            pipeline(_request(sampling=_SamplingParams(extra_args=_tick_extra_args(chunk_index=chunk_index))))
+        seen[str(onset)] = pipeline._ar_sessions["world-1"].image_condition.shape[2]
+        return captured
+
+    short = run(4)
+    long = run(20)
+    assert seen["4"] == 9 and seen["20"] == 24
+    for early, late in zip(short, long, strict=True):
+        torch.testing.assert_close(early, late)

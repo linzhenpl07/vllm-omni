@@ -26,8 +26,10 @@ from benchmarks.ar_diffusion.quality_metrics import (
     psnr,
     resample_to,
     sharpness,
+    sky_locked_fraction,
     ssim,
 )
+from benchmarks.ar_diffusion.quality_metrics import SKY_LOCKED_THRESHOLD
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
 
@@ -459,3 +461,92 @@ def test_comparing_within_one_prompt_is_allowed(tmp_path):
     reference = _write_run(cli, tmp_path / "768x480_p0_seed0", "a forest path")
     floor = _write_run(cli, tmp_path / "768x480_p0_seed1", "a forest path", seed=1)
     cli._reject_mixed_prompts(reference, [floor])
+
+
+# ── Losing the scene ───────────────────────────────────────────────────────
+
+
+def _sky_clip(frames=40, height=64, width=64, *, subject_rows=12):
+    """A camera that has drifted off the scene: flat bright blue, one dark shape.
+
+    This is what the failure looks like -- most of the frame a smooth wash, with
+    the subject the only thing left in it.
+    """
+    clip = torch.zeros(frames, 3, height, width)
+    clip[:, 0] = 0.45  # r
+    clip[:, 1] = 0.55  # g
+    clip[:, 2] = 0.75  # b, dominant
+    clip[:, :, height - subject_rows :, width // 3 : 2 * width // 3] = 0.08
+    return clip
+
+
+def _scene_clip(frames=40, height=64, width=64):
+    """A working frame: textured throughout, no large smooth expanse."""
+    return _structured(3, frames=frames, height=height, width=width)
+
+
+def test_a_camera_that_drifts_into_the_sky_is_detected():
+    assert sky_locked_fraction(_sky_clip()) > SKY_LOCKED_THRESHOLD
+
+
+def test_a_frame_with_a_scene_in_it_is_not_flagged():
+    assert sky_locked_fraction(_scene_clip()) < SKY_LOCKED_THRESHOLD
+
+
+def test_sharpness_cannot_see_this_failure_but_the_sky_measure_can():
+    """The reason this metric exists.
+
+    A dark subject against a flat wash has strong edges and almost nothing to
+    average them against, so Laplacian variance *rises* when the clip is
+    ruined. In one real sweep the sky-locked clip had the highest sharpness of
+    its group. Any judge built on sharpness alone will rank this backwards.
+    """
+    sky, scene = _sky_clip(), _scene_clip()
+    assert sharpness(sky) > sharpness(scene)  # backwards, and that is the point
+    assert sky_locked_fraction(sky) > sky_locked_fraction(scene)
+
+
+def test_a_dark_blue_clip_is_not_mistaken_for_sky():
+    """Shadowed forest is blue too. Brightness is what separates them."""
+    dim = _sky_clip() * 0.35
+    assert sky_locked_fraction(dim) < SKY_LOCKED_THRESHOLD
+
+
+def test_the_opening_wash_is_skipped():
+    """Every resolution opens on a flat wash while the first chunk resolves.
+
+    That is the causal decoder, not the clip's quality, so those frames must not
+    be able to condemn a clip on their own.
+    """
+    clip = torch.cat([_sky_clip(frames=24), _scene_clip(frames=24)])
+    assert sky_locked_fraction(clip) < SKY_LOCKED_THRESHOLD
+
+
+def test_a_clip_shorter_than_the_skipped_prefix_still_scores():
+    assert 0.0 <= sky_locked_fraction(_sky_clip(frames=4)) <= 1.0
+
+
+def test_the_report_names_a_lost_scene_and_does_not_call_the_rest_good():
+    """Read in one direction only: over the line is broken, under it is silent.
+
+    A camera buried in foliage fills the frame just as completely and scores
+    about 0.27, so passing this test is not a quality verdict.
+    """
+    reference = _sample("ref", 64, 64, 0, frames=40, clip=_scene_clip())
+    lost = _sample("lost", 64, 64, 1, frames=40, clip=_sky_clip())
+    fine = _sample("fine", 64, 64, 2, frames=40, clip=_structured(5, frames=40))
+    report = build_report(reference, [lost, fine])
+
+    assert report.lost_the_scene(0)
+    assert not report.lost_the_scene(1)
+    text = format_report(report)
+    assert "LOST THE SCENE" in text
+    assert "not the same as good" in text
+
+
+def test_a_broken_reference_is_called_out_rather_than_used_silently():
+    """Every distance is measured against the reference. If the reference itself
+    lost its scene, the whole report is meaningless and must say so."""
+    reference = _sample("ref", 64, 64, 0, frames=40, clip=_sky_clip())
+    report = build_report(reference, [_sample("c", 64, 64, 1, frames=40, clip=_scene_clip())])
+    assert "REFERENCE HAS LOST ITS SCENE" in format_report(report)

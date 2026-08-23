@@ -135,6 +135,70 @@ def sharpness(clip: Clip) -> float:
     return float(edges.flatten(1).var(dim=1).mean())
 
 
+SKY_LOCKED_THRESHOLD = 0.40
+"""Above this share of sky-like pixels, a clip has lost its scene.
+
+Fixed from a labelled set of 36 clips before the held-out check, and left
+alone afterwards. The check then found a seventh sky-lock nobody had looked
+at, so the number is not fitted to the eye that labelled it.
+"""
+
+
+def sky_locked_fraction(clip: Clip, *, first_frame: int = 24, stride: int = 4) -> float:
+    """Share of the frame that is bright, blue-dominant and smooth.
+
+    :func:`sharpness` cannot see the failure that matters most here. When the
+    camera drifts off the scene and ends up staring at the sky, the clip is
+    ruined and its Laplacian variance goes *up*: a dark head against a flat
+    wash has strong edges and little else to average them against. The worst
+    clip in one sweep had the highest sharpness of its group.
+
+    So ask the question directly. A clip that has lost its scene is mostly one
+    smooth bright expanse; a working one carries trunks, a path and a figure as
+    well. This counts the expanse. It is a fraction, which matters: the first
+    attempt at this used bottom-third detail *over* whole-frame detail and
+    scored the sky-locked clips highest of all, because the denominator
+    collapses exactly when the frame goes flat.
+
+    Early frames are skipped. Every resolution opens on a flat wash while the
+    first chunk resolves, which is a property of the causal decoder and not of
+    the clip's quality.
+
+    Read it in one direction only. Above :data:`SKY_LOCKED_THRESHOLD` the clip
+    has lost its scene -- 7 of 7 in the labelled set, against one false
+    positive in thirty. Below it, the clip is *not sky-locked*, which is not
+    the same as good: a camera that ends up inside a bush fills the frame just
+    as completely and scores 0.27. Nothing here certifies a clip.
+
+    A judge covering the whole family was tried and rejected. The unifying
+    property looked like low diversity -- one material filling the frame --
+    so it scored the entropy of a coarse RGB histogram. It separated the
+    labelled set and then failed held-out: among the clips it flagged were
+    good ones at the reference resolution, because a dim monochrome forest is
+    low-diversity by intent. It was measuring the prompt, not the failure.
+    """
+    _validate(clip, "clip")
+    frames = clip[first_frame::stride]
+    if frames.shape[0] == 0:
+        frames = clip[-1:]
+    red, green, blue = frames[:, 0], frames[:, 1], frames[:, 2]
+    # A plain channel mean, not the luma weights :func:`sharpness` uses. The
+    # threshold below was validated against this definition; changing it would
+    # invalidate the number without changing what it is trying to say.
+    local_std = _local_std(frames.mean(dim=1))
+    sky = (blue > red + 0.02) & (blue > green + 0.02) & (frames.amax(dim=1) > 0.35) & (local_std < 0.03)
+    return float(sky.to(clip.dtype).mean())
+
+
+def _local_std(luma: torch.Tensor, radius: int = 2) -> torch.Tensor:
+    """Standard deviation over a square window, one value per pixel."""
+    size = 2 * radius + 1
+    padded = F.pad(luma[:, None], (radius,) * 4, mode="reflect")
+    mean = F.avg_pool2d(padded, size, stride=1)
+    mean_square = F.avg_pool2d(padded**2, size, stride=1)
+    return torch.sqrt(torch.clamp(mean_square - mean**2, min=0.0))[:, 0]
+
+
 def load_lpips():
     """Return an LPIPS callable, or None when no implementation is installed."""
     try:
@@ -259,7 +323,9 @@ class QualityReport:
     candidates: list[ResolutionSample] = field(default_factory=list)
     distances: list[PairedDistance] = field(default_factory=list)
     sharpness_values: list[float] = field(default_factory=list)
+    sky_values: list[float] = field(default_factory=list)
     reference_sharpness: float = 0.0
+    reference_sky: float = 0.0
     floor: DivergenceFloor | None = None
 
     def resolves(self, index: int, metric: str) -> bool | None:
@@ -292,6 +358,15 @@ class QualityReport:
             return None
         return abs(self.sharpness_values[index] - self.reference_sharpness) > spread
 
+    def lost_the_scene(self, index: int) -> bool:
+        """Has this candidate's camera drifted off the scene into the sky?
+
+        No floor is consulted. This is not a distance from the reference, it is
+        a property of the clip on its own: either most of the frame is sky or it
+        is not. A reference clip that scores above the line is itself broken.
+        """
+        return self.sky_values[index] > SKY_LOCKED_THRESHOLD
+
 
 def build_report(
     reference: ResolutionSample,
@@ -301,7 +376,11 @@ def build_report(
     lpips=None,
 ) -> QualityReport:
     """Score every candidate against the reference, with the floor attached."""
-    report = QualityReport(reference=reference, reference_sharpness=sharpness(reference.frames))
+    report = QualityReport(
+        reference=reference,
+        reference_sharpness=sharpness(reference.frames),
+        reference_sky=sky_locked_fraction(reference.frames),
+    )
     for candidate in candidates:
         report.candidates.append(candidate)
         report.distances.append(paired_distance(reference, candidate, lpips=lpips))
@@ -310,6 +389,9 @@ def build_report(
         # the same detail spans fewer pixels. Measuring at native size would
         # therefore report lower resolutions as sharper, which is backwards.
         report.sharpness_values.append(sharpness(resample_to(candidate.frames, reference.height, reference.width)))
+        # At native size. This is a share of the frame, so it does not change
+        # with resampling, and resampling would only blur the smoothness test.
+        report.sky_values.append(sky_locked_fraction(candidate.frames))
     if floor_samples:
         report.floor = measure_divergence_floor([reference, *floor_samples], lpips=lpips)
     return report
@@ -334,6 +416,10 @@ def format_report(report: QualityReport) -> str:
     ref = report.reference
     lines.append(f"reference  {ref.label}  {ref.width}x{ref.height}  seed={ref.seed}  frames={ref.frames.shape[0]}")
     lines.append(f"           sharpness {report.reference_sharpness:.4e}")
+    lines.append(f"           sky       {report.reference_sky:.3f}")
+    if report.reference_sky > SKY_LOCKED_THRESHOLD:
+        lines.append("           REFERENCE HAS LOST ITS SCENE -- every distance below is measured")
+        lines.append("           against a broken clip. Re-run the reference on another seed.")
     lines.append("")
 
     floor = report.floor
@@ -370,6 +456,11 @@ def format_report(report: QualityReport) -> str:
         ratio = own / report.reference_sharpness if report.reference_sharpness else float("nan")
         note = _SHARPNESS_VERDICTS[report.sharpness_resolves(index)]
         lines.append(f"  {'sharp':<8} {own:>10.4e}   {ratio:.3f}x reference -- {note}")
+        sky = report.sky_values[index]
+        if report.lost_the_scene(index):
+            lines.append(f"  {'sky':<8} {sky:>10.3f}   LOST THE SCENE -- the camera is looking at the sky")
+        else:
+            lines.append(f"  {'sky':<8} {sky:>10.3f}   not sky-locked (which is not the same as good)")
         lines.append("")
 
     lines.append("Paired metrics are an upper bound on damage, never a lower bound: whatever part")
@@ -378,6 +469,11 @@ def format_report(report: QualityReport) -> str:
     lines.append("Expect PSNR and SSIM to stay inside the floor through degradation a viewer would")
     lines.append("call obvious -- they compare pixels that were never meant to line up. Sharpness")
     lines.append("is the more decisive signal here. Neither replaces looking at the frames.")
+    lines.append("")
+    lines.append("Sharpness cannot see a camera that has drifted off the scene -- it goes UP when a")
+    lines.append("clip fills with sky. Read the sky line in one direction: over the line the clip is")
+    lines.append("gone, under it only means not-sky-locked. A camera buried in foliage fills the")
+    lines.append("frame just as completely and scores about 0.27, so nothing here certifies a clip.")
     return "\n".join(lines)
 
 

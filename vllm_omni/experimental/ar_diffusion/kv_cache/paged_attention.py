@@ -7,11 +7,14 @@ from __future__ import annotations
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import torch
 
 from vllm_omni.experimental.ar_diffusion.kv_cache.paged import compute_slot_mapping
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backend import MultipleOf
 
 _LAYER_IDX_TENSORS: dict[int, torch.Tensor] = {}
 
@@ -679,6 +682,29 @@ def _resolve_fa_version(head_size: int) -> int:
             version = 2
         _FA_VERSION_BY_HEAD_SIZE[head_size] = version
     return version
+
+
+def supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    """Block sizes the kernel this module dispatches to will accept.
+
+    Same shape as vLLM's ``AttentionBackend.get_supported_kernel_block_sizes``
+    -- a plain int is that exact size, ``MultipleOf(b)`` is any positive
+    multiple of ``b`` -- but answered here rather than read off a backend,
+    because AR-Diffusion does not go through backend selection. It calls
+    ``flash_attn_varlen_func`` itself, choosing between vLLM's CUDA build and
+    ROCm's AITER a few lines below, and only this module knows which.
+
+    It lives next to that choice so there is one place to change. The
+    constraint is a property of the kernel, not of the card, and the kernels
+    reachable from here agree on 16 today: vLLM's CUDA FlashAttention, ROCm
+    AITER, and upstream ``flash_attn`` all advertise ``MultipleOf(16)``. Other
+    backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
+    FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
+    caller must treat this as data to be queried, never as the number 16.
+    """
+    from vllm.v1.attention.backend import MultipleOf
+
+    return [MultipleOf(16)]
 
 
 def _rocm_flash_attn_varlen_func():

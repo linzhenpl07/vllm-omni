@@ -272,10 +272,19 @@ async def generate_one(
     latents: list[Any] = []
     inner = await backend.manager.create_session(label)
     try:
+        # Written as they arrive, not just accumulated. A long session can die
+        # on a ceiling nobody knew was there -- the paged block table is indexed
+        # by absolute position and runs out around tick 224 at this resolution
+        # -- and frames are only produced after the loop, so a crash at tick 225
+        # used to throw away 17 minutes of generation. Latents are ~600 KB each.
+        latent_dir = directory / "latents"
+        latent_dir.mkdir(parents=True, exist_ok=True)
         for chunk_index in range(args.chunks):
             await inner.accept_event(_camera_event(chunk_index))
             output = await inner.next_chunk()
-            latents.append(_tick_latents(output).detach().cpu())
+            tick_latent = _tick_latents(output).detach().cpu()
+            torch.save(tick_latent, latent_dir / f"tick_{chunk_index:05d}.pt")
+            latents.append(tick_latent)
     finally:
         await inner.close()
 

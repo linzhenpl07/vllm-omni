@@ -240,7 +240,6 @@ async def generate_one(
     """Run one session at one resolution and prompt, and write its frames to disk."""
     import torch
 
-    from benchmarks.ar_diffusion.decoding_session import DecodingSession
     from benchmarks.ar_diffusion.engine_binding import build_realtime_backend
     from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
 

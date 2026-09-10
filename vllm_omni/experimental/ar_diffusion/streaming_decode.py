@@ -38,6 +38,11 @@ where ``post_quant_conv`` runs, not anything about streaming, and the result
 moves with the torch version. The control that isolates chunking is the same
 session decoded in a single call through this same path.
 
+The consumer is the stepwise execution path: one ``generate()`` is one
+session, ``post_decode`` emits one chunk per AR block, and the pipeline holds
+one state per ``request_id``, releasing it when the runner closes or resets
+that AR session -- so decoder state and KV state share a single lifetime.
+
 Only ``torch`` is imported here so the contract can be exercised without a
 device, a checkpoint, or the distributed VAE stack.
 """

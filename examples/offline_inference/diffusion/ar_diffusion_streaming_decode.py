@@ -1,23 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Run LingBot-World 2.0 as a realtime AR-Diffusion session, streaming pixels.
+"""Stream LingBot-World 2.0 pixels from one stepwise request.
 
-Builds on ``lingbot_world_v2_realtime.py``: same ``AsyncOmni`` engine,
-``ARDiffusionSessionManager``, and JSONL event protocol, generating one
-three-latent-frame AR block per tick. The difference is what happens to each
-block once it is generated -- instead of saving the raw latent for later
-offline decode, this feeds it straight into :class:`WanStreamingDecoder`, so
-pixels for chunk *N* are on disk before chunk *N + 1* starts generating,
-carrying the causal VAE's temporal cache across chunks rather than clearing
-it every call. This is the path that matters for realtime delivery: it is
-what makes time-to-first-frame one chunk's decode rather than the whole
-session's.
+One ``AsyncOmni.generate()`` drives the whole rollout: each AR block leaves
+``post_decode()`` as one video chunk, decoded through that session's own
+temporal VAE cache rather than as an isolated clip. That is what this script
+shows end to end -- chunk *N + 1* continues chunk *N*, so the streamed timeline
+carries the same frame count as an offline whole-clip decode of the same
+latents (9 frames for the opening chunk, then 12 per chunk) instead of losing
+each block's opening frame to a restarted decoder.
+
+The decode lives inside the pipeline, keyed by ``request_id``, so nothing here
+owns a VAE: this file is a client of the served path, and the same chunks reach
+a WebSocket client of ``/v1/realtime/video`` unchanged.
 
 Examples::
 
     python examples/offline_inference/diffusion/ar_diffusion_streaming_decode.py \
-        --image scene.png --prompt "a lit hallway" --events events.jsonl \
-        --output-dir /tmp/lingbot-stream
+        --image scene.png --prompt "a lit hallway" \
+        --action-script actions.json --output-dir /tmp/lingbot-stream
+
+``--action-script`` is a JSON list with one three-frame camera action list per
+AR block, for example ``[[["w"], ["w"], ["w"]], [["a"], [], []]]``.
 """
 
 from __future__ import annotations
@@ -32,118 +36,81 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    # Only for type hints -- the real import stays deferred inside run() so
+    # Only for type hints -- the real imports stay deferred inside run() so
     # --help and the offline validation helpers don't require a CUDA-enabled
     # vLLM install.
-    import torch
+    import numpy as np
 
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
-_CAMERA_ACTION_SCHEMA = "lingbot.camera_actions.v1"
 _FRAMES_PER_BLOCK = 3
+_TEMPORAL_COMPRESSION = 4
 # ((117 pixel frames - 1) / VAE temporal factor 4 + 1) / 3 latent frames.
-_MAX_REALTIME_TICKS = 10
-
-
-def _camera_event_data(frames: list[list[str]]) -> dict[str, Any]:
-    """Build the event-side script consumed by LingBotCameraControlReducer."""
-    return {"mode": "script", "frames": frames}
-
-
-def _to_vae_latent_space(latent: torch.Tensor, *, mean: torch.Tensor, std: torch.Tensor) -> torch.Tensor:
-    """Invert the checkpoint's latent normalization: model space -> VAE latent space.
-
-    The realtime tick path always uses ``output_type="latent"`` and returns raw
-    model-space latents; the pipeline's own non-tick decode path applies this
-    same inversion (``LingBotWorldCausalDMDPipeline._vae_latent_stats``) before
-    calling ``vae.decode``. ``WanStreamingDecoder.decode_chunk`` documents its
-    input as already carrying that inversion -- skip this and every chunk
-    decodes to a valid-looking but wrong video while latency/finite checks
-    stay green, because nothing downstream can detect the wrong scale.
-    """
-    return latent * std + mean
+_MAX_CHUNKS = 10
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run an in-process realtime LingBot-World 2.0 session with streaming pixel decode.",
+        description="Stream decoded LingBot-World 2.0 video chunks from a single stepwise request.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument("--model", default=_MODEL, help="Hugging Face model ID or local checkpoint path.")
     parser.add_argument("--image", required=True, help="Initial RGB image.")
-    parser.add_argument("--prompt", required=True, help="Initial scene prompt.")
+    parser.add_argument("--prompt", required=True, help="Scene prompt for the rollout.")
     parser.add_argument(
-        "--events",
+        "--action-script",
         required=True,
-        help="JSONL file with one prompt/action event per AR block; at most 10 events.",
+        help="JSON file holding one three-frame camera action list per AR block; at most 10 blocks.",
     )
     parser.add_argument("--output-dir", required=True, help="Directory for decoded frames and metadata.")
-    parser.add_argument("--session-id", default="lingbot-world", help="Persistent world session identifier.")
+    parser.add_argument("--request-id", default="lingbot-world-stream", help="Request id; also the session id.")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--gpu-memory-fraction", type=float, default=0.1)
+    parser.add_argument("--gpu-memory-fraction", type=float, default=0.6)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--enforce-eager", action="store_true")
-    parser.add_argument(
-        "--vae-device",
-        default="cuda",
-        help="Device for the standalone streaming-decode VAE instance (separate from the engine's workers).",
-    )
-    parser.add_argument("--vae-dtype", choices=("fp32", "bf16", "fp16"), default="bf16")
     return parser.parse_args(argv)
 
 
-def _load_events(path: Path) -> list[dict[str, Any]]:
-    events: list[dict[str, Any]] = []
-    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"events line {line_number} is not valid JSON: {exc.msg}.") from None
-        if not isinstance(value, dict):
-            raise ValueError(f"events line {line_number} must be a JSON object.")
-        event_id = value.get("event_id")
-        if isinstance(event_id, bool) or not isinstance(event_id, int) or event_id < 0:
-            raise ValueError(f"events line {line_number} requires a non-negative integer event_id.")
-        prompt = value.get("prompt")
-        if prompt is not None and (not isinstance(prompt, str) or not prompt.strip()):
-            raise ValueError(f"events line {line_number} prompt must be a non-empty string.")
-        frames = value.get("frames")
-        if frames is not None:
-            if not isinstance(frames, list) or len(frames) != _FRAMES_PER_BLOCK:
-                raise ValueError(f"events line {line_number} frames must contain exactly three lists.")
-            for frame in frames:
-                if not isinstance(frame, list) or any(not isinstance(action, str) for action in frame):
-                    raise ValueError(f"events line {line_number} frames must contain only action strings.")
-        if prompt is None and frames is None:
-            raise ValueError(f"events line {line_number} must update prompt and/or frames.")
-        events.append({"event_id": event_id, "prompt": prompt, "frames": frames})
-    if not events:
-        raise ValueError("events file must contain at least one event.")
-    if len(events) > _MAX_REALTIME_TICKS:
+def _load_action_script(path: Path) -> list[list[list[str]]]:
+    """Parse and validate the per-block camera action script.
+
+    The shape is the one ``sampling_params.extra_args["camera_action_script"]``
+    takes: one entry per AR block, each entry three per-frame action lists.
+    """
+    try:
+        value = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--action-script is not valid JSON: {exc.msg}.") from None
+    if not isinstance(value, list) or not value:
+        raise ValueError("--action-script must be a non-empty JSON list of per-block action lists.")
+    if len(value) > _MAX_CHUNKS:
         raise ValueError(
-            "events file must contain at most "
-            f"{_MAX_REALTIME_TICKS} events because the current LingBot realtime "
+            f"--action-script must hold at most {_MAX_CHUNKS} blocks because the current LingBot "
             "image-condition horizon is 117 pixel frames."
         )
-    event_ids = [event["event_id"] for event in events]
-    if event_ids != sorted(set(event_ids)):
-        raise ValueError("event_id values must be unique and strictly increasing.")
-    return events
+    script: list[list[list[str]]] = []
+    for block_index, block in enumerate(value):
+        if not isinstance(block, list) or len(block) != _FRAMES_PER_BLOCK:
+            raise ValueError(f"--action-script block {block_index} must contain exactly three frame action lists.")
+        frames: list[list[str]] = []
+        for frame in block:
+            if not isinstance(frame, list) or any(not isinstance(action, str) for action in frame):
+                raise ValueError(f"--action-script block {block_index} frames must contain only action strings.")
+            frames.append(list(frame))
+        script.append(frames)
+    return script
 
 
 def _validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     image = Path(args.image).expanduser().resolve()
-    events = Path(args.events).expanduser().resolve()
+    action_script = Path(args.action_script).expanduser().resolve()
     output_dir = Path(args.output_dir).expanduser().resolve()
     if not image.is_file():
         raise ValueError("--image must point to an existing file.")
-    if not events.is_file():
-        raise ValueError("--events must point to an existing JSONL file.")
+    if not action_script.is_file():
+        raise ValueError("--action-script must point to an existing JSON file.")
     if not args.prompt.strip():
         raise ValueError("--prompt must contain non-whitespace text.")
     if args.height <= 0 or args.width <= 0 or args.height % 16 or args.width % 16:
@@ -152,48 +119,66 @@ def _validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
         raise ValueError("--tensor-parallel-size must be positive.")
     if not math.isfinite(args.gpu_memory_fraction) or not 0 < args.gpu_memory_fraction <= 1:
         raise ValueError("--gpu-memory-fraction must be in (0, 1].")
-    return image, events, output_dir
+    if not args.request_id.strip():
+        raise ValueError("--request-id must contain non-whitespace text.")
+    return image, action_script, output_dir
+
+
+def _as_frames(value: Any) -> np.ndarray:
+    """Normalize one streamed chunk to ``[T, H, W, 3]`` uint8.
+
+    ``output_type="np"`` reaches the client as a float array in ``[0, 1]``,
+    with or without the leading batch axis depending on how the formatter
+    unwrapped it; a nested list is the ``"pil"`` shape. Anything else means
+    the chunk is not pixels -- most likely the request still asked for
+    latents -- and is worth failing on rather than saving.
+    """
+    import numpy as np
+    import PIL.Image
+    import torch
+
+    if isinstance(value, list):
+        if len(value) == 1 and isinstance(value[0], list):
+            value = value[0]
+        if value and all(isinstance(frame, PIL.Image.Image) for frame in value):
+            return np.stack([np.asarray(frame.convert("RGB")) for frame in value])
+    if isinstance(value, torch.Tensor):
+        value = value.detach().float().cpu().numpy()
+    if not isinstance(value, np.ndarray):
+        raise RuntimeError(f"Expected decoded pixels from each AR block, got {type(value).__name__}.")
+    if value.ndim == 5 and value.shape[0] == 1:
+        value = value[0]
+    if value.ndim != 4 or value.shape[-1] != 3:
+        raise RuntimeError(f"Expected one [T, H, W, 3] pixel chunk per AR block, got shape {tuple(value.shape)}.")
+    if value.dtype != np.uint8:
+        value = (np.clip(value, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    return value
+
+
+def _chunk_metadata(output: Any) -> dict[str, Any]:
+    multimodal = getattr(output, "multimodal_output", None) or {}
+    metadata = multimodal.get("metadata") if isinstance(multimodal, dict) else None
+    ar_diffusion = metadata.get("ar_diffusion") if isinstance(metadata, dict) else None
+    if not isinstance(ar_diffusion, dict):
+        raise RuntimeError("Streamed chunk is missing its ar_diffusion metadata envelope.")
+    return dict(ar_diffusion)
 
 
 async def run(argv: Sequence[str] | None = None) -> Path:
     args = parse_args(argv)
-    image, events_path, output_dir = _validate_args(args)
-    events = _load_events(events_path)
+    image, action_script_path, output_dir = _validate_args(args)
+    camera_action_script = _load_action_script(action_script_path)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Imports stay below pure input validation so --help and helper tests do not
     # require a CUDA-enabled vLLM installation.
-    import torch
-    from diffusers import AutoencoderKLWan
+    import numpy as np
 
-    from vllm_omni.diffusion.models.lingbot_world.actions import LingBotCameraControlReducer
     from vllm_omni.entrypoints.async_omni import AsyncOmni
-    from vllm_omni.experimental.ar_diffusion.consumer import ARDiffusionOmniTickConsumer
-    from vllm_omni.experimental.ar_diffusion.session import (
-        ARDiffusionSessionEvent,
-        ARDiffusionSessionManager,
-        ARDiffusionWorkerLifecycle,
-    )
-    from vllm_omni.experimental.ar_diffusion.streaming_decode import WanStreamingDecoder
-    from vllm_omni.experimental.ar_diffusion.tick_protocol import ARDiffusionControlInput
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
-    vae_dtype = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}[args.vae_dtype]
-    # A standalone VAE instance for streaming decode: the engine's own VAE
-    # runs inside its worker process(es) and is not reachable from here, and
-    # decode-on-generate is exactly the sequential, whole-clip-barrier path
-    # this example exists to avoid. The checkpoint's ``vae`` subfolder is the
-    # same weights the engine would otherwise decode with.
-    vae = AutoencoderKLWan.from_pretrained(args.model, subfolder="vae", torch_dtype=vae_dtype)
-    vae = vae.to(device=args.vae_device).eval()
-    for parameter in vae.parameters():
-        parameter.requires_grad_(False)
-    decoder = WanStreamingDecoder(vae)
-    decode_state = decoder.new_decode_state(args.session_id)
-    # Same per-channel statistics the pipeline uses in _vae_latent_stats; see
-    # _to_vae_latent_space for why this rescale has to happen before decode.
-    latent_mean = torch.as_tensor(vae.config.latents_mean, device=args.vae_device, dtype=vae_dtype).view(1, -1, 1, 1, 1)
-    latent_std = torch.as_tensor(vae.config.latents_std, device=args.vae_device, dtype=vae_dtype).view(1, -1, 1, 1, 1)
+    num_chunks = len(camera_action_script)
+    num_frames = (num_chunks * _FRAMES_PER_BLOCK - 1) * _TEMPORAL_COMPRESSION + 1
 
     engine = AsyncOmni(
         model=args.model,
@@ -201,6 +186,10 @@ async def run(argv: Sequence[str] | None = None) -> Path:
         enforce_eager=args.enforce_eager,
         tensor_parallel_size=args.tensor_parallel_size,
         max_num_seqs=1,
+        # One request, many chunks: the stepwise contract from #6844. Streaming
+        # output is what turns each post_decode() into a delivered chunk.
+        step_execution=True,
+        diffusion_streaming_output=True,
         model_config={
             "ar_diffusion_height": args.height,
             "ar_diffusion_width": args.width,
@@ -213,98 +202,70 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     sampling = OmniDiffusionSamplingParams(
         height=args.height,
         width=args.width,
-        num_frames=9,
+        num_frames=num_frames,
         num_inference_steps=4,
         max_sequence_length=512,
         seed=args.seed,
-        output_type="latent",
-        extra_args={"flow_shift": 5.0},
+        # Pixels, not latents: this is what routes the chunk through the
+        # session's streaming VAE decode instead of handing back a tensor.
+        output_type="np",
+        extra_args={"flow_shift": 5.0, "camera_action_script": camera_action_script},
     )
-    consumer = ARDiffusionOmniTickConsumer(
-        engine,
-        prompt_provider=lambda tick: {
-            "prompt": tick.prompt,
-            "multi_modal_data": {"image": str(image)},
-        },
-        sampling_params_list=[sampling],
-        diffusion_stage_id=0,
-    )
-    manager = ARDiffusionSessionManager(
-        tick_consumer=consumer,
-        lifecycle=ARDiffusionWorkerLifecycle(engine, stage_ids=[0], timeout=180.0),
-        max_pending_events=32,
-        control_reducer_factory=LingBotCameraControlReducer,
-    )
-    session = await manager.create_session(args.session_id)
+    prompt = {"prompt": args.prompt, "multi_modal_data": {"image": str(image)}}
+
     measurements: list[dict[str, Any]] = []
     t_start = time.perf_counter()
     first_frame_at: float | None = None
+    chunk_started = t_start
     try:
-        for chunk_index, event in enumerate(events):
-            controls = ()
-            if event["frames"] is not None:
-                controls = (
-                    ARDiffusionControlInput(
-                        track="camera",
-                        schema=_CAMERA_ACTION_SCHEMA,
-                        data=_camera_event_data(event["frames"]),
-                    ),
-                )
-            await session.accept_event(
-                ARDiffusionSessionEvent(
-                    event_id=event["event_id"],
-                    prompt=event["prompt"]
-                    if event["prompt"] is not None
-                    else (args.prompt if chunk_index == 0 else None),
-                    controls=controls,
-                )
-            )
-            gen_started = time.perf_counter()
-            output = await session.next_chunk()
-            gen_elapsed = time.perf_counter() - gen_started
-            if len(output.images) != 1 or not isinstance(output.images[0], torch.Tensor):
-                raise RuntimeError("Expected one latent tensor from each realtime LingBot chunk.")
-            latent = output.images[0].detach().to(device=args.vae_device, dtype=vae_dtype)
-            latent = _to_vae_latent_space(latent, mean=latent_mean, std=latent_std)
-            metadata = consumer.chunk_metadata(output).to_dict()
-
-            decode_started = time.perf_counter()
-            frames = decoder.decode_chunk(latent, decode_state)
-            decode_elapsed = time.perf_counter() - decode_started
+        async for output in engine.generate(prompt, sampling, request_id=args.request_id):
+            images = getattr(output, "images", None)
+            if not images:
+                continue
+            if len(images) != 1:
+                raise RuntimeError("Expected exactly one decoded chunk per AR block.")
+            frames = _as_frames(images[0])
+            now = time.perf_counter()
             if first_frame_at is None:
-                first_frame_at = time.perf_counter() - t_start
+                first_frame_at = now - t_start
+            chunk_index = len(measurements)
+            metadata = _chunk_metadata(output)
 
-            torch.save(frames.detach().cpu(), output_dir / f"chunk_{chunk_index:03d}.pt")
+            np.save(output_dir / f"chunk_{chunk_index:03d}.npy", frames)
             (output_dir / f"chunk_{chunk_index:03d}.json").write_text(
                 json.dumps(metadata, indent=2, sort_keys=True) + "\n"
             )
             measurements.append(
                 {
                     "chunk_index": chunk_index,
-                    "generation_latency_seconds": gen_elapsed,
-                    "decode_latency_seconds": decode_elapsed,
+                    "chunk_latency_seconds": now - chunk_started,
+                    "frames": int(frames.shape[0]),
                     "frame_shape": list(frames.shape),
-                    "finite": bool(torch.isfinite(frames).all()),
-                    "resident_decoder_bytes": decode_state.nbytes(),
                     "metadata": metadata,
                 }
             )
+            chunk_started = now
             print(json.dumps(measurements[-1], sort_keys=True), flush=True)
     finally:
-        try:
-            decoder.release(decode_state)
-        finally:
-            try:
-                await manager.close_session(args.session_id)
-            finally:
-                engine.shutdown()
+        engine.shutdown()
 
+    delivered_frames = sum(int(chunk["frames"]) for chunk in measurements)
     summary_path = output_dir / "summary.json"
     summary_path.write_text(
         json.dumps(
             {
+                "request_id": args.request_id,
+                "chunks_delivered": len(measurements),
+                "chunks_expected": num_chunks,
+                "frames_delivered": delivered_frames,
+                "frames_expected": num_frames,
+                # The point of session-owned decode: a streamed rollout carries
+                # the same frame timeline as an offline decode of the same
+                # latents. Per-chunk decode would deliver fewer, because every
+                # block would re-expand its own opening frame.
+                "matches_offline_frame_timeline": delivered_frames == num_frames,
                 "time_to_first_frame_seconds": first_frame_at,
-                "resident_decoder_bytes_final": measurements[-1]["resident_decoder_bytes"] if measurements else None,
+                "total_seconds": time.perf_counter() - t_start,
                 "chunks": measurements,
             },
             indent=2,

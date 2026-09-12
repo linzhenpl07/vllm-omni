@@ -75,6 +75,15 @@ from vllm_omni.experimental.ar_diffusion.tick_protocol import (
 
 logger = init_logger(__name__)
 
+# Resident streaming-decoder cache per session, as bytes per output pixel in
+# fp32: measured once on the reference checkpoint at 37832 KiB for a 64x64
+# output. Every cached tensor is [B, C, <= CACHE_T, H/8, W/8] per causal
+# convolution, so the total scales with height * width and never with session
+# length; tests/diffusion/ar_diffusion/test_streaming_decode.py pins that
+# scaling, and at 832x480 in bf16 this yields the 1801 MiB the decoder was
+# measured to hold.
+_STREAMING_DECODE_BYTES_PER_PIXEL_FP32 = 37832 * 1024 / (64 * 64)
+
 if TYPE_CHECKING:
     from diffusers.video_processor import VideoProcessor
     from tqdm.std import tqdm as TqdmProgressBar
@@ -552,6 +561,10 @@ class LingBotWorldCausalDMDPipeline(
             profiler_targets=[
                 "vae.encode",
                 "vae.decode",
+                # Streaming decode never reaches vae.decode, so it needs its
+                # own stage or a streamed rollout reports no decode time at
+                # all -- the one stage this path changes.
+                "_streaming_decode_chunk",
                 "_generate_block",
                 "text_encoder.forward",
                 "tokenizer.forward",
@@ -606,7 +619,32 @@ class LingBotWorldCausalDMDPipeline(
                     _MAX_SEQUENCE_LENGTH,
                 ),
             ),
-            model_owned_state_bytes_per_session=condition_bytes_per_session,
+            model_owned_state_bytes_per_session=(
+                condition_bytes_per_session + self._streaming_decode_bytes_per_session()
+            ),
+        )
+
+    def _streaming_decode_bytes_per_session(self) -> int:
+        """Resident streaming-decoder bytes one session can hold, for admission.
+
+        ``model_owned_state_bytes_per_session`` is what the runner subtracts
+        from the KV budget before sizing the block pools, and this cache is
+        three orders of magnitude larger than the image condition that used to
+        be the only entry: leaving it out lets the profiler report a
+        configuration as fitting and then OOM partway through the second
+        session's rollout.
+
+        Declared for every session rather than only for pixel-output ones: the
+        field is documented as a conservative upper bound, it is fixed at load
+        time, and whether a request asks for pixels is not known then.
+        """
+        decoder = self._streaming_decoder()
+        if decoder is None:
+            return 0
+        return decoder.declared_state_bytes(
+            height=self._ar_height,
+            width=self._ar_width,
+            dtype=self.vae.dtype,
         )
 
     @contextmanager
@@ -1288,42 +1326,49 @@ class LingBotWorldCausalDMDPipeline(
             stage_durations=self.stage_durations if hasattr(self, "stage_durations") else None,
         )
 
+    def _vae_would_tile(self, latents: torch.Tensor) -> bool:
+        """Whether ``vae.decode`` would take its tiled path for this shape.
+
+        Tiled decode splits a frame spatially and drives the module's own
+        ``feat_cache`` across those tiles, so a per-session cache threaded
+        through it is a separate design and is not attempted here. The test
+        mirrors ``AutoencoderKLWan._decode``: the flag alone does not tile, the
+        latent also has to exceed a tile, so a sub-threshold resolution with
+        tiling enabled still streams. A VAE that sets the flag but reports no
+        tile size is treated as tiling, because the safe answer when the
+        threshold is unknown is the one that keeps ``vae.decode`` in charge.
+        """
+        if not bool(getattr(self.vae, "use_tiling", False)):
+            return False
+        compression = int(getattr(self.vae, "spatial_compression_ratio", None) or self.vae_scale_factor_spatial)
+        tile_latent_min_height = int(getattr(self.vae, "tile_sample_min_height", None) or 0) // compression
+        tile_latent_min_width = int(getattr(self.vae, "tile_sample_min_width", None) or 0) // compression
+        return bool(latents.shape[-2] > tile_latent_min_height or latents.shape[-1] > tile_latent_min_width)
+
     def _streaming_decoder(self) -> WanStreamingDecoder | None:
         """The session-owned streaming decoder, or ``None`` on a VAE that cannot stream.
 
-        Tiled and patch-parallel decode split a frame spatially and drive the
-        module's own ``feat_cache`` across those tiles, so a per-session cache
-        threaded through them is a separate design and is not attempted here;
-        those configurations keep the stateless per-chunk decode. The check
-        runs once and its result is cached, including the negative.
+        Only the decoder's own capability is decided here, and the decision is
+        cached including the negative. Whether a particular *shape* would have
+        been tiled is a per-call question and lives in :meth:`_vae_would_tile`.
         """
         if self._streaming_decode_unsupported:
             return None
         if self._cached_streaming_decoder is not None:
             return self._cached_streaming_decoder
-        decoder: WanStreamingDecoder | None = None
-        reason: str | None = None
-        vae_patch_parallel_size = int(
-            getattr(getattr(self.od_config, "parallel_config", None), "vae_patch_parallel_size", 1) or 1
-        )
-        if bool(getattr(self.vae, "use_tiling", False)):
-            reason = "VAE tiling is enabled"
-        elif vae_patch_parallel_size > 1:
-            reason = f"VAE patch parallelism is enabled (vae_patch_parallel_size={vae_patch_parallel_size})"
-        else:
-            try:
-                decoder = WanStreamingDecoder(self.vae)
-                # Materialize the cache geometry now: a decoder that cannot
-                # report it would otherwise fail on the first chunk instead.
-                _ = decoder.num_causal_convs
-            except TypeError as exc:
-                decoder = None
-                reason = str(exc)
-        if decoder is None:
+        try:
+            decoder = WanStreamingDecoder(
+                self.vae,
+                bytes_per_pixel_fp32=_STREAMING_DECODE_BYTES_PER_PIXEL_FP32,
+            )
+            # Materialize the cache geometry now: a decoder that cannot report
+            # it would otherwise fail on the first chunk instead.
+            _ = decoder.num_causal_convs
+        except TypeError as exc:
             logger.warning(
                 "LingBot streaming decode is unavailable (%s); AR blocks will be decoded independently, "
                 "which drops each block's opening frame and restarts temporal context at every boundary.",
-                reason,
+                exc,
             )
             self._streaming_decode_unsupported = True
             return None
@@ -1338,15 +1383,16 @@ class LingBotWorldCausalDMDPipeline(
         return state
 
     def _release_streaming_decode_state(self, session_id: str) -> None:
-        """Drop one session's decoder cache. Safe for a session that never decoded."""
+        """Drop one session's decoder cache. Safe for a session that never decoded.
+
+        The state is released directly rather than through
+        ``WanStreamingDecoder.release``, which is the same one-line call: the
+        decoder's method exists for a caller holding only the
+        ``SupportsStreamingDecode`` protocol, and this pipeline holds the state.
+        """
         state = self._streaming_decode_states.pop(session_id, None)
-        if state is None:
-            return
-        decoder = self._cached_streaming_decoder
-        if decoder is None:
+        if state is not None:
             state.release()
-        else:
-            decoder.release(state)
 
     def _decode_chunk_to_pixels(
         self, latents: torch.Tensor, *, output_type: str, session_id: str | None = None
@@ -1371,20 +1417,33 @@ class LingBotWorldCausalDMDPipeline(
         """
         latent_mean, latent_std = self._vae_latent_stats(latents)
         vae_latents = (latents * latent_std + latent_mean).to(dtype=self.vae.dtype)
-        decoder = None if session_id is None else self._streaming_decoder()
+        decoder = None
+        if session_id is not None and not self._vae_would_tile(vae_latents):
+            decoder = self._streaming_decoder()
         if decoder is None:
             video = self.vae.decode(vae_latents, return_dict=False)[0]
         else:
-            state = self._streaming_decode_state(decoder, cast(str, session_id))
-            try:
-                video = decoder.decode_chunk(vae_latents, state)
-            except Exception:
-                # A half-advanced cache cannot be resumed: the session's next
-                # chunk would continue from a temporal context that was never
-                # completed, so drop it here rather than at close.
-                self._release_streaming_decode_state(cast(str, session_id))
-                raise
+            video = self._streaming_decode_chunk(decoder, vae_latents, cast(str, session_id))
         return self._video_processor().postprocess_video(video, output_type=output_type)
+
+    def _streaming_decode_chunk(
+        self, decoder: WanStreamingDecoder, vae_latents: torch.Tensor, session_id: str
+    ) -> torch.Tensor:
+        """Decode one chunk through ``session_id``'s temporal cache.
+
+        A separate method so the profiler has a stage to wrap: streaming never
+        calls ``vae.decode``, and without this a profiled rollout would report
+        no decode time for the one stage this path changes.
+        """
+        state = self._streaming_decode_state(decoder, session_id)
+        try:
+            return decoder.decode_chunk(vae_latents, state)
+        except Exception:
+            # A half-advanced cache cannot be resumed: the session's next chunk
+            # would continue from a temporal context that was never completed,
+            # so drop it here rather than at close.
+            self._release_streaming_decode_state(session_id)
+            raise
 
     def _video_processor(self) -> VideoProcessor:
         processor = getattr(self, "_cached_video_processor", None)

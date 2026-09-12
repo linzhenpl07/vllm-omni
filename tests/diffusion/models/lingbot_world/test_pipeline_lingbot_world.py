@@ -185,9 +185,13 @@ class _StubCausalDecoder:
 
     def __init__(self) -> None:
         self.first_chunk_flags: list[bool] = []
+        # Identity of the cache each call wrote through, so an interleaved run
+        # can assert that a session never advanced another session's context.
+        self.cache_ids: list[int] = []
 
     def __call__(self, x: torch.Tensor, *, feat_cache, feat_idx, first_chunk: bool = False):
         self.first_chunk_flags.append(bool(first_chunk))
+        self.cache_ids.append(id(feat_cache))
         for _ in range(self.NUM_CONVS):
             index = feat_idx[0]
             feat_cache[index] = x.detach().clone()
@@ -202,7 +206,11 @@ class _StubVAE(_FakePretrained):
     def __init__(self, *, streaming: bool = True):
         if streaming:
             self.decoder = _StubCausalDecoder()
-            self.post_quant_conv = lambda latent: latent
+            # Recorded, not discarded: on the streaming branch this is the only
+            # place the tensor handed to the decoder can be observed, and it is
+            # what carries the checkpoint's latent rescale.
+            self.post_quant_inputs: list[torch.Tensor] = []
+            self.post_quant_conv = self._record_post_quant
             self._cached_conv_counts = {"decoder": _StubCausalDecoder.NUM_CONVS, "encoder": 2}
             # Module-owned cache the shared VAE keeps for whole-clip decode;
             # streaming must never write through it.
@@ -217,6 +225,10 @@ class _StubVAE(_FakePretrained):
         self.encode_inputs: list[torch.Tensor] = []
         self.decode_inputs: list[torch.Tensor] = []
         self.on_decode = None
+
+    def _record_post_quant(self, latent: torch.Tensor) -> torch.Tensor:
+        self.post_quant_inputs.append(latent.detach().clone())
+        return latent
 
     def encode(self, video: torch.Tensor):
         self.encode_inputs.append(video.detach().clone())
@@ -485,7 +497,36 @@ def test_ar_diffusion_capability_uses_fixed_tp_local_lingbot_geometry() -> None:
     assert spec.sink_frames == 3
     assert [(branch.name, branch.local_index) for branch in spec.kv_branches] == [("main", 0)]
     assert spec.cross_attention_lengths == {"text": 512}
-    assert spec.model_owned_state_bytes_per_session == 9_600
+    # The image condition (9,600 B) plus the streaming decoder's own per-session
+    # temporal cache. The cache dwarfs the condition at any real resolution, and
+    # the runner subtracts this field from the KV budget before sizing its pools,
+    # so leaving the cache out of it over-commits device memory.
+    assert spec.model_owned_state_bytes_per_session == 9_600 + 2_421_248
+
+
+def test_session_admission_accounts_for_the_streaming_decoder_cache(monkeypatch) -> None:
+    """The declaration scales with output area, and is the condition alone when
+    the VAE cannot stream."""
+    module = _load_pipeline_module()
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+
+    pipeline = _pipeline(module)
+    small = pipeline.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+
+    wide = _pipeline(module)
+    wide._ar_width = wide._ar_width * 2
+    widened = wide.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session
+    # Twice the area: the decoder cache doubles, so the total grows by far more
+    # than the image condition alone could account for.
+    assert widened - small > 2_000_000
+
+    # A VAE without the causal-cache contract cannot stream, so there is no
+    # decoder cache to declare and the figure falls back to the condition.
+    bare = _pipeline(module)
+    for attribute in ("decoder", "post_quant_conv", "_cached_conv_counts"):
+        if hasattr(bare.vae, attribute):
+            delattr(bare.vae, attribute)
+    assert bare.ar_diffusion_kv_cache_spec().model_owned_state_bytes_per_session == 9_600
 
 
 def test_preprocess_materializes_external_inputs_before_worker_execution(tmp_path: Path) -> None:
@@ -1846,6 +1887,27 @@ def _run_stepwise(pipeline, state):
     return outputs
 
 
+def _stepwise_chunks(pipeline, state, ar_state):
+    """Yield one chunk at a time, binding AR state around each invocation.
+
+    The runner binds runner-owned KV for the duration of one stepwise
+    invocation and releases it again, so a generator that suspends at each
+    chunk boundary is what lets two requests be driven the way the scheduler
+    drives them at session_capacity > 1: A-chunk0, B-chunk0, A-chunk1, ...
+    """
+    with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
+        pipeline.prepare_encode(state)
+    while not state.request_denoise_completed:
+        output = None
+        with pipeline.bind_ar_diffusion_state(state.request_id, ar_state):
+            noise = pipeline.denoise_step(None, states=[state])
+            pipeline.step_scheduler(state, noise)
+            if state.chunk_denoise_completed:
+                output = pipeline.post_decode(state)
+        if output is not None:
+            yield output
+
+
 def test_pipeline_declares_step_execution_support() -> None:
     module = _load_pipeline_module()
     pipeline = _pipeline(module)
@@ -2144,26 +2206,54 @@ def test_streaming_decode_state_is_dropped_on_session_reset(monkeypatch) -> None
     pipeline.reset_ar_diffusion_session("req-reset")
 
 
-def test_streaming_decode_keeps_concurrent_sessions_isolated(monkeypatch) -> None:
-    """Two sessions must not share one temporal cache."""
+def test_streaming_decode_keeps_interleaved_sessions_isolated(monkeypatch) -> None:
+    """Two sessions ticking alternately must not share one temporal cache.
+
+    Running one rollout to completion before the other starts would only show
+    that the dict is keyed by request id. The failure worth catching is chunk N
+    of one session advancing the other's cache mid-rollout, which needs the
+    interleaving the scheduler actually produces.
+    """
     module = _load_pipeline_module()
     processed = _capture_video_processor(monkeypatch)
     pipeline = _streaming_pipeline(module)
-    first = _stepwise_state(request_id="req-a", num_frames=21)
-    first.sampling.output_type = "np"
-    second = _stepwise_state(request_id="req-b", num_frames=21)
-    second.sampling.output_type = "np"
+    states = []
+    for request_id in ("req-a", "req-b"):
+        state = _stepwise_state(request_id=request_id, num_frames=21)
+        state.sampling.output_type = "np"
+        states.append(state)
+    runs = [_stepwise_chunks(pipeline, state, _FakeARState(state.request_id)) for state in states]
 
-    for state in (first, second):
-        with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
-            _run_stepwise(pipeline, state)
+    chunks: list[tuple[str, int]] = []
+    while runs:
+        for run in list(runs):
+            try:
+                output = next(run)
+            except StopIteration:
+                runs.remove(run)
+                continue
+            metadata = output.output["metadata"]["ar_diffusion"]
+            chunks.append((metadata["session_id"], metadata["chunk_index"]))
+
+    # A-chunk0, B-chunk0, A-chunk1, B-chunk1: the sessions really are interleaved.
+    assert chunks == [("req-a", 0), ("req-b", 0), ("req-a", 1), ("req-b", 1)]
 
     caches = pipeline._streaming_decode_states
     assert set(caches) == {"req-a", "req-b"}
     assert caches["req-a"].feat_map is not caches["req-b"].feat_map
-    # Each session opens its own rollout, so each expands one opening frame.
-    assert pipeline.vae.decoder.first_chunk_flags.count(True) == 2
-    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)] * 2
+    # Every frame of a session was decoded through that session's own cache,
+    # three frames per chunk, and each session opened exactly one rollout.
+    cache_a, cache_b = (id(caches["req-a"].feat_map), id(caches["req-b"].feat_map))
+    assert pipeline.vae.decoder.cache_ids == [cache_a] * 3 + [cache_b] * 3 + [cache_a] * 3 + [cache_b] * 3
+    assert pipeline.vae.decoder.first_chunk_flags == (
+        [True, False, False] + [True, False, False] + [False] * 3 + [False] * 3
+    )
+    assert [shape for shape, _ in processed] == [
+        (1, 3, 9, 16, 16),
+        (1, 3, 9, 16, 16),
+        (1, 3, 12, 16, 16),
+        (1, 3, 12, 16, 16),
+    ]
 
 
 def test_streaming_decode_failure_drops_the_half_advanced_cache(monkeypatch) -> None:
@@ -2186,12 +2276,86 @@ def test_streaming_decode_failure_drops_the_half_advanced_cache(monkeypatch) -> 
     assert pipeline._streaming_decode_states == {}
 
 
-def test_streaming_decode_falls_back_when_the_vae_cannot_stream(monkeypatch) -> None:
-    """Tiled decode drives its own cache, so those VAEs keep per-chunk decode."""
+def _enable_vae_tiling(pipeline, *, tile_sample_min: int) -> None:
+    """Configure the stub VAE the way registry.py configures the real one."""
+    pipeline.vae.use_tiling = True
+    pipeline.vae.spatial_compression_ratio = 8
+    pipeline.vae.tile_sample_min_height = tile_sample_min
+    pipeline.vae.tile_sample_min_width = tile_sample_min
+
+
+def test_streaming_decode_receives_rescaled_latents(monkeypatch) -> None:
+    """The streaming branch must invert the checkpoint's latent statistics.
+
+    Nothing downstream can catch a miss here: the pixels stay finite and
+    correctly shaped, only wrongly scaled. Request mode and the fallback path
+    observe the rescale through ``vae.decode``'s recorded input, which streaming
+    never reaches, so this asserts on what ``post_quant_conv`` received.
+    """
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        pipeline.prepare_encode(state)
+        while not state.chunk_denoise_completed:
+            pipeline.step_scheduler(state, pipeline.denoise_step(None, states=[state]))
+        model_space = state.latents.clone()
+        pipeline.post_decode(state)
+
+    shape = (1, -1, 1, 1, 1)
+    latent_mean = torch.as_tensor(pipeline.vae.config.latents_mean, dtype=model_space.dtype).view(*shape)
+    latent_std = torch.as_tensor(pipeline.vae.config.latents_std, dtype=model_space.dtype).view(*shape)
+    expected = (model_space * latent_std + latent_mean).to(dtype=pipeline.vae.dtype)
+
+    recorded = torch.cat(pipeline.vae.post_quant_inputs, dim=2)
+    assert recorded.shape == expected.shape, "one recorded frame per latent frame in the chunk"
+    torch.testing.assert_close(recorded, expected, rtol=0, atol=0)
+    # And the rescale is not a no-op on this fixture, so the assertion bites.
+    assert not torch.equal(expected, model_space.to(dtype=pipeline.vae.dtype))
+
+
+def test_streaming_decode_is_reported_to_the_profiler(monkeypatch) -> None:
+    """A streamed rollout must report decode time, not zero.
+
+    The profiler wraps ``vae.decode``, which streaming never calls, so without
+    its own stage the one stage this path changes would be invisible -- and a
+    perf regression in the streaming decoder would be too.
+    """
+    module = _load_pipeline_module()
+    _capture_video_processor(monkeypatch)
+    pipeline = _pipeline(
+        module,
+        transformer=_RecordingTransformer(),
+        od_config=_od_config(
+            enable_diffusion_pipeline_profiler=True,
+        ),
+    )
+    pipeline._ar_height = 16
+    pipeline._ar_width = 16
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        outputs = _run_stepwise(pipeline, state)
+
+    stage = f"{type(pipeline).__name__}._streaming_decode_chunk"
+    durations = pipeline.stage_durations
+    assert stage in durations, f"streamed decode is unprofiled; stages seen: {sorted(durations)}"
+    assert durations[stage] > 0.0
+    # The stage reaches the consumer on every streamed chunk, not just at the end.
+    assert all(stage in (output.stage_durations or {}) for output in outputs)
+
+
+def test_streaming_decode_falls_back_when_the_vae_would_tile(monkeypatch) -> None:
+    """Tiled decode drives its own cache, so a tiling shape keeps per-chunk decode."""
     module = _load_pipeline_module()
     processed = _capture_video_processor(monkeypatch)
     pipeline = _streaming_pipeline(module)
-    pipeline.vae.use_tiling = True
+    # A latent of 2x2 exceeds a one-latent-cell tile, so vae.decode would tile.
+    _enable_vae_tiling(pipeline, tile_sample_min=8)
     state = _stepwise_state(num_frames=21)
     state.sampling.output_type = "np"
 
@@ -2202,8 +2366,32 @@ def test_streaming_decode_falls_back_when_the_vae_cannot_stream(monkeypatch) -> 
     assert [tuple(latents.shape) for latents in pipeline.vae.decode_inputs] == [(1, 16, 3, 2, 2)] * 2
     assert pipeline.vae.decoder.first_chunk_flags == []
     assert pipeline._streaming_decode_states == {}
+    # Nine frames per chunk instead of 9 then 12: the frame loss being removed.
     assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 9, 16, 16)]
     assert [output.output["payload"] for output in outputs] == [{"video": "frames-1"}, {"video": "frames-2"}]
+
+
+def test_streaming_decode_survives_tiling_enabled_below_the_tile_threshold(monkeypatch) -> None:
+    """``use_tiling`` alone does not tile, so such a shape must still stream.
+
+    ``AutoencoderKLWan._decode`` tiles only when the latent exceeds a tile. A
+    gate on the flag alone would give up streaming -- and a frame per block --
+    on a configuration that would never have tiled.
+    """
+    module = _load_pipeline_module()
+    processed = _capture_video_processor(monkeypatch)
+    pipeline = _streaming_pipeline(module)
+    # A 2x2 latent is within a tile this size, so vae.decode would not tile.
+    _enable_vae_tiling(pipeline, tile_sample_min=256)
+    state = _stepwise_state(num_frames=21)
+    state.sampling.output_type = "np"
+
+    with pipeline.bind_ar_diffusion_state(state.request_id, _FakeARState(state.request_id)):
+        _run_stepwise(pipeline, state)
+
+    assert pipeline.vae.decode_inputs == []
+    assert pipeline.vae.decoder.first_chunk_flags == [True] + [False] * 5
+    assert [shape for shape, _ in processed] == [(1, 3, 9, 16, 16), (1, 3, 12, 16, 16)]
 
 
 def test_registry_and_model_exports_resolve_official_pipeline_class_name() -> None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stream LingBot-World 2.0 pixels from one stepwise request.
 
 One ``AsyncOmni.generate()`` drives the whole rollout: each AR block leaves
@@ -7,8 +7,10 @@ One ``AsyncOmni.generate()`` drives the whole rollout: each AR block leaves
 temporal VAE cache rather than as an isolated clip. That is what this script
 shows end to end -- chunk *N + 1* continues chunk *N*, so the streamed timeline
 carries the same frame count as an offline whole-clip decode of the same
-latents (9 frames for the opening chunk, then 12 per chunk) instead of losing
-each block's opening frame to a restarted decoder.
+latents instead of losing each block's opening frame to a restarted decoder.
+Only the session's first latent frame expands to a single raw frame; on the
+default checkpoint, whose block is three latent frames at a temporal factor of
+four, that is 9 frames for the opening chunk and 12 for every later one.
 
 The decode lives inside the pipeline, keyed by ``request_id``, so nothing here
 owns a VAE: this file is a client of the served path, and the same chunks reach
@@ -20,8 +22,12 @@ Examples::
         --image scene.png --prompt "a lit hallway" \
         --action-script actions.json --output-dir /tmp/lingbot-stream
 
-``--action-script`` is a JSON list with one three-frame camera action list per
-AR block, for example ``[[["w"], ["w"], ["w"]], [["a"], [], []]]``.
+``--action-script`` is a JSON list with one camera action list per AR block,
+for example ``[[["w"], ["w"], ["w"]], [["a"], [], []]]`` for a checkpoint that
+generates three latent frames per block. The frames per block, the temporal
+compression and the number of blocks that fit the condition horizon are read
+off the checkpoint rather than assumed, so the script can be repointed with
+``--model``.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -42,10 +49,9 @@ if TYPE_CHECKING:
     import numpy as np
 
 _MODEL = "robbyant/lingbot-world-v2-14b-causal-fast-diffusers"
-_FRAMES_PER_BLOCK = 3
-_TEMPORAL_COMPRESSION = 4
-# ((117 pixel frames - 1) / VAE temporal factor 4 + 1) / 3 latent frames.
-_MAX_CHUNKS = 10
+# Mirrors _MAX_RAW_FRAMES in vllm_omni/diffusion/models/lingbot_world/pipeline.py:
+# the image-condition horizon is the pipeline's constant, not the checkpoint's.
+_MAX_RAW_FRAMES = 117
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -60,7 +66,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--action-script",
         required=True,
-        help="JSON file holding one three-frame camera action list per AR block; at most 10 blocks.",
+        help=(
+            "JSON file holding one camera action list per AR block. Both the per-block frame count "
+            "and the number of blocks that fit are read off the checkpoint, not assumed."
+        ),
     )
     parser.add_argument("--output-dir", required=True, help="Directory for decoded frames and metadata.")
     parser.add_argument("--request-id", default="lingbot-world-stream", help="Request id; also the session id.")
@@ -74,10 +83,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 
 def _load_action_script(path: Path) -> list[list[list[str]]]:
-    """Parse and validate the per-block camera action script.
+    """Parse the per-block camera action script, without assuming its geometry.
 
     The shape is the one ``sampling_params.extra_args["camera_action_script"]``
-    takes: one entry per AR block, each entry three per-frame action lists.
+    takes: one entry per AR block, each entry one per-frame action list. How
+    many frames a block holds is a property of the checkpoint, so it is checked
+    in :func:`_validate_against_checkpoint` once the configs have been read.
     """
     try:
         value = json.loads(path.read_text())
@@ -85,15 +96,10 @@ def _load_action_script(path: Path) -> list[list[list[str]]]:
         raise ValueError(f"--action-script is not valid JSON: {exc.msg}.") from None
     if not isinstance(value, list) or not value:
         raise ValueError("--action-script must be a non-empty JSON list of per-block action lists.")
-    if len(value) > _MAX_CHUNKS:
-        raise ValueError(
-            f"--action-script must hold at most {_MAX_CHUNKS} blocks because the current LingBot "
-            "image-condition horizon is 117 pixel frames."
-        )
     script: list[list[list[str]]] = []
     for block_index, block in enumerate(value):
-        if not isinstance(block, list) or len(block) != _FRAMES_PER_BLOCK:
-            raise ValueError(f"--action-script block {block_index} must contain exactly three frame action lists.")
+        if not isinstance(block, list) or not block:
+            raise ValueError(f"--action-script block {block_index} must be a non-empty list of frame action lists.")
         frames: list[list[str]] = []
         for frame in block:
             if not isinstance(frame, list) or any(not isinstance(action, str) for action in frame):
@@ -101,6 +107,60 @@ def _load_action_script(path: Path) -> list[list[list[str]]]:
             frames.append(list(frame))
         script.append(frames)
     return script
+
+
+def _model_config_json(model: str, relative_path: str) -> dict[str, Any]:
+    """Read one config file out of a local checkpoint or a Hub repo."""
+    if os.path.isdir(model):
+        return json.loads((Path(model) / relative_path).read_text())
+    from huggingface_hub import hf_hub_download
+
+    return json.loads(Path(hf_hub_download(repo_id=model, filename=relative_path)).read_text())
+
+
+def _checkpoint_geometry(model: str) -> tuple[int, int]:
+    """Read ``(frames_per_block, temporal_compression)`` off the checkpoint.
+
+    The pipeline takes both from the model --
+    ``transformer.config.num_frames_per_block`` and
+    ``vae.config.scale_factor_temporal`` -- so hardcoding 3 and 4 here would
+    silently build a wrong action script and an inconsistent ``num_frames`` the
+    moment ``--model`` points at a checkpoint with different geometry.
+    """
+    transformer_config = _model_config_json(model, "transformer/config.json")
+    vae_config = _model_config_json(model, "vae/config.json")
+    if "num_frames_per_block" not in transformer_config:
+        raise ValueError(
+            f"{model}'s transformer/config.json declares no num_frames_per_block, "
+            "so this checkpoint does not generate AR blocks and cannot be streamed this way."
+        )
+    frames_per_block = int(transformer_config["num_frames_per_block"])
+    temporal_compression = int(vae_config.get("scale_factor_temporal", 4))
+    if frames_per_block <= 0 or temporal_compression <= 0:
+        raise ValueError(
+            "the checkpoint reports a non-positive block geometry "
+            f"(num_frames_per_block={frames_per_block}, scale_factor_temporal={temporal_compression})."
+        )
+    return frames_per_block, temporal_compression
+
+
+def _validate_against_checkpoint(
+    script: list[list[list[str]]], *, frames_per_block: int, temporal_compression: int
+) -> int:
+    """Check the script against the checkpoint and return the frame count to request."""
+    for block_index, block in enumerate(script):
+        if len(block) != frames_per_block:
+            raise ValueError(
+                f"--action-script block {block_index} holds {len(block)} frame action lists, but this "
+                f"checkpoint generates {frames_per_block} latent frames per AR block."
+            )
+    max_chunks = ((_MAX_RAW_FRAMES - 1) // temporal_compression + 1) // frames_per_block
+    if len(script) > max_chunks:
+        raise ValueError(
+            f"--action-script holds {len(script)} blocks, but this checkpoint's "
+            f"{_MAX_RAW_FRAMES}-frame image-condition horizon fits at most {max_chunks}."
+        )
+    return (len(script) * frames_per_block - 1) * temporal_compression + 1
 
 
 def _validate_args(args: argparse.Namespace) -> tuple[Path, Path, Path]:
@@ -177,8 +237,13 @@ async def run(argv: Sequence[str] | None = None) -> Path:
     from vllm_omni.entrypoints.async_omni import AsyncOmni
     from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+    frames_per_block, temporal_compression = _checkpoint_geometry(args.model)
     num_chunks = len(camera_action_script)
-    num_frames = (num_chunks * _FRAMES_PER_BLOCK - 1) * _TEMPORAL_COMPRESSION + 1
+    num_frames = _validate_against_checkpoint(
+        camera_action_script,
+        frames_per_block=frames_per_block,
+        temporal_compression=temporal_compression,
+    )
 
     engine = AsyncOmni(
         model=args.model,

@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Session-owned streaming VAE decode for realtime AR-Diffusion.
 
 A causal video decoder already decodes one latent frame at a time, carrying a
 bounded temporal cache between frames. What it does not do today is carry that
-cache *between requests*: every decode call clears it, so a chunk can only be
+cache *between calls*: every decode call clears it, so a chunk can only be
 decoded as part of a whole clip.
 
 This module moves the cache from the decoder module to the session, which is
@@ -23,10 +24,11 @@ which is the quantity session admission has to account for.
 
 Measured on the reference checkpoint at 832x480 in bf16, on one RTX PRO 6000
 with torch 2.11: chunking is neutral -- a session decoded in four chunks is
-bit-identical to the same session decoded in one call -- resident decoder
-state holds at 1801 MiB across every chunk, and time to first frame drops
-from 1.9 s, the whole-clip barrier, to 0.31 s without the session costing more
-in total.
+bit-identical to the same session decoded in one call -- and resident decoder
+state holds at 1801 MiB across every chunk. What a session gains is structural
+rather than a speedup: a chunk becomes decodable on its own, so pixels leave on
+the block that produced them instead of after the last one, and the session's
+opening frame is expanded once rather than once per block.
 
 Note what "neutral" is measured against. ``AutoencoderKLWan._decode`` applies
 ``post_quant_conv`` to the whole latent at once, while the tiled path in this
@@ -49,6 +51,7 @@ device, a checkpoint, or the distributed VAE stack.
 
 from __future__ import annotations
 
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
@@ -153,6 +156,26 @@ class WanStreamingDecoder:
         # be silently unset for a caller that does.
         self._bytes_per_pixel_fp32 = bytes_per_pixel_fp32
 
+    def _execution_context(self) -> AbstractContextManager[None]:
+        """The autoencoder's own execution context, when it exposes one.
+
+        Every public compute entry point on ``OmniAutoencoderKLWan`` --
+        ``encode``, ``decode``, ``decode_with_chunks``, ``tile_exec`` -- runs
+        inside ``_execution_context()``, which is where autocast is entered for
+        fp16/bf16 parameters (and on NPU is the only place
+        ``torch.npu.amp.autocast`` is entered at all). This decoder drives
+        ``post_quant_conv`` and ``decoder`` directly, so it has to enter the
+        same context or streamed chunks compute under a different numeric and
+        dispatch context from the whole-clip decode they are compared against.
+
+        A plain ``diffusers`` autoencoder has no such hook, and then there is
+        nothing to enter.
+        """
+        context = getattr(self._vae, "_execution_context", None)
+        if callable(context):
+            return context()
+        return nullcontext()
+
     @property
     def num_causal_convs(self) -> int:
         counts = getattr(self._vae, "_cached_conv_counts", None)
@@ -168,16 +191,27 @@ class WanStreamingDecoder:
     def decode_chunk(self, latent: torch.Tensor, state: StreamingDecodeState) -> torch.Tensor:
         """Decode ``latent`` as the continuation of ``state``'s session.
 
-        ``latent`` is ``[B, C, T, H, W]`` in latent space, already rescaled by
+        ``latent`` is ``[1, C, T, H, W]`` in latent space, already rescaled by
         the pipeline's latent statistics. Frames are decoded one at a time, the
         same loop the non-streaming path runs, with the cache carried across
-        calls instead of cleared. The returned tensor is ``[B, 3, T', H', W']``
+        calls instead of cleared. The returned tensor is ``[1, 3, T', H', W']``
         where ``T'`` is smaller for a session's first chunk: the opening latent
         frame expands to a single raw frame and every later one to the full
         temporal factor.
         """
         if latent.ndim != 5:
             raise ValueError(f"latent must be [B, C, T, H, W]; got shape {tuple(latent.shape)}.")
+        if latent.shape[0] != 1:
+            # One state is one session's temporal context, so a batch would
+            # thread several samples through a single cache. ``decode()``
+            # handles a batch by decoding each sample with its own cleared
+            # cache (``use_slicing``); there is no equivalent here, and the
+            # streaming contract is one session per state, so refuse rather
+            # than silently mix samples.
+            raise ValueError(
+                "streaming decode takes one sample per session state; "
+                f"got batch size {latent.shape[0]}. Decode each sample through its own state."
+            )
         if len(state.feat_map) != self.num_causal_convs:
             raise ValueError(
                 "Decoder state does not belong to this decoder: "
@@ -188,21 +222,22 @@ class WanStreamingDecoder:
             raise ValueError("latent must carry at least one frame.")
 
         decoded_frames = []
-        for index in range(num_frames):
-            state.conv_idx[0] = 0
-            frame = self._vae.post_quant_conv(latent[:, :, index : index + 1])
-            # first_chunk marks the session's opening frame, not the call's:
-            # that is what makes chunk N + 1 continue chunk N rather than
-            # restart the causal expansion.
-            decoded_frames.append(
-                self._vae.decoder(
-                    frame,
-                    feat_cache=state.feat_map,
-                    feat_idx=state.conv_idx,
-                    first_chunk=(state.frames_decoded == 0),
+        with self._execution_context():
+            for index in range(num_frames):
+                state.conv_idx[0] = 0
+                frame = self._vae.post_quant_conv(latent[:, :, index : index + 1])
+                # first_chunk marks the session's opening frame, not the call's:
+                # that is what makes chunk N + 1 continue chunk N rather than
+                # restart the causal expansion.
+                decoded_frames.append(
+                    self._vae.decoder(
+                        frame,
+                        feat_cache=state.feat_map,
+                        feat_idx=state.conv_idx,
+                        first_chunk=(state.frames_decoded == 0),
+                    )
                 )
-            )
-            state.frames_decoded += 1
+                state.frames_decoded += 1
 
         out = torch.cat(decoded_frames, dim=2)
         patch_size = getattr(getattr(self._vae, "config", None), "patch_size", None)

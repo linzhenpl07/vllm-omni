@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import itertools
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -283,8 +284,16 @@ class ARDiffusionPagedForwardContext:
         # its first block is the history's own tail block whenever the history
         # stopped part way through one, and keeps the history's position.
         first_position: dict[int, int] = {}
+        #
+        # Only two index ranges can hold a token the window keeps: the sink's
+        # blocks, and the blocks from the recent window's start onward. The table
+        # keeps a null entry for every evicted position, so it grows with the
+        # session; reading just these two ranges keeps this at the window's size.
         table = self.kv_cache.block_table(self.adapter)
-        for index in range(-(-history // block_size)):
+        history_blocks = -(-history // block_size)
+        sink_blocks = min(-(-sink_end // block_size), history_blocks)
+        recent_first_block = max(max(recent_start, 0) // block_size, sink_blocks)
+        for index in itertools.chain(range(sink_blocks), range(recent_first_block, history_blocks)):
             block = int(table[index])
             if block != self.kv_cache.null_block_id:
                 first_position.setdefault(block, index * block_size)
@@ -540,6 +549,13 @@ def supported_kernel_block_sizes() -> list[int | MultipleOf]:
     backends in the same tree do not -- ``hpc_attn`` accepts only 64, and
     FlashInfer advertises pages of 128 or more solely on Blackwell -- so a
     caller must treat this as data to be queried, never as the number 16.
+
+    vLLM's FlashAttention backend does advertise a single 128-token page when FA4
+    runs its dedicated head-size-256 kernel on SM100/SM110. That kernel is not
+    reachable from here: ``get_flash_attn_version`` selects it only when the
+    caller passes ``supports_fa4_hd256=True``, and :func:`_resolve_fa_version`
+    does not, so a head size of 256 falls back to FA2, which pages at any
+    multiple of 16. Passing that flag later has to change this answer as well.
     """
     from vllm.v1.attention.backend import MultipleOf
 

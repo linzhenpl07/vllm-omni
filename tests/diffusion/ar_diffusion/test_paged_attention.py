@@ -794,6 +794,52 @@ def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
     assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
 
 
+class _CountingTable(list):
+    """A block table that counts reads by index."""
+
+    def __init__(self, items):
+        super().__init__(items)
+        self.reads = 0
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            self.reads += 1
+        return super().__getitem__(key)
+
+
+def test_reading_the_window_touches_only_the_blocks_it_can_keep():
+    """The block table grows with the session; reading the window must not.
+
+    Every evicted position stays in the table as a null entry, so walking the
+    whole table costs more on every tick of a long session. Only the sink's
+    blocks and the recent window's blocks can hold a kept token, so those are
+    all the read may index -- checked on a session long enough that the table is
+    many times the window.
+    """
+    device = torch.device("cpu")
+    kv, st = make_state(device=device, window_chunks=2, sink_chunks=1, chunk_size=RAGGED_CHUNK)
+    real_block_table = kv.block_table
+    reads: list[int] = []
+    table_lengths: list[int] = []
+    for _ in range(60):
+        ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(device)
+        counted = _CountingTable(real_block_table(st.adapter(POS)))
+        kv.block_table = lambda adapter, counted=counted: counted
+        try:
+            ctx.build_block_table(action_len=0, query_len=RAGGED_CHUNK, device=device)
+        finally:
+            del kv.block_table
+        reads.append(counted.reads)
+        table_lengths.append(len(counted))
+        st.commit_paged_context(POS)
+
+    assert table_lengths[-1] > 10 * ctx.max_video_blocks, "the table never outgrew the window, so nothing was tested"
+    assert max(reads) <= ctx.max_video_blocks, (
+        f"read {max(reads)} table entries for a {ctx.max_video_blocks}-block window"
+    )
+
+
 def test_the_checkpoints_own_default_resolution_can_build_a_cache():
     """832x480 is what LingBot World v2 ships as its default, and it could not run.
 

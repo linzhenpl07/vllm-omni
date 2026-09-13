@@ -44,13 +44,20 @@ def make_state(
     window_chunks=2,
     chunk_size=BLOCK,
     sink_chunks=0,
+    reset_at_boundary=False,
     dtype=torch.float32,
     device=torch.device("cpu"),
 ):
     """Build a cache. ``chunk_size`` defaults to the block size, but the two are
     independent -- the shipped 832x480 gives 1560 tokens per frame against
     16-token blocks, so a frame is 97.5 blocks."""
-    cfg = ARDiffusionKVConfig(enable=True, chunk_size=chunk_size, window_chunks=window_chunks, sink_chunks=sink_chunks)
+    cfg = ARDiffusionKVConfig(
+        enable=True,
+        chunk_size=chunk_size,
+        window_chunks=window_chunks,
+        sink_chunks=sink_chunks,
+        reset_at_boundary=reset_at_boundary,
+    )
     kv = ARDiffusionKVCache(
         cfg,
         num_layers=num_layers,
@@ -1119,9 +1126,222 @@ def test_a_ragged_window_keeps_the_block_table_a_fixed_shape():
     assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
     # The window has to have actually filled, or none of the above was tested.
     assert max(kv_lens) > min(kv_lens)
-    # Rounding up keeps at most one block more than the token window asks for.
     assert max(kv_lens) <= ctx.max_video_blocks * BLOCK
-    assert max(kv_lens) < max_video_tokens + BLOCK
+    # Whole blocks are read, so each of the two boundaries -- the sink's end and
+    # the recent window's start -- can contribute up to BLOCK - 1 tokens the
+    # window no longer needs.
+    assert max(kv_lens) <= max_video_tokens + 2 * (BLOCK - 1)
+
+
+def _poison_pools(kv: ARDiffusionKVCache) -> None:
+    for pool in (*kv._k_pools, *kv._v_pools):
+        pool.fill_(float("nan"))
+
+
+def _write_prepared_chunk(
+    kv: ARDiffusionKVCache, ctx, *, dtype: torch.dtype, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Write fresh K/V for a prepared chunk, poisoning the rest of its blocks first.
+
+    Blocks are handed out whole and a reused block keeps whatever it held, so a
+    slot read without having been written would not look unusual. Every slot of
+    the chunk's blocks that this chunk does not write is set to NaN first --
+    except the leading slots of a block the history still occupies -- so reading
+    one turns the attention output NaN.
+    """
+    mapping = ctx.current_video_slot_mapping
+    first_slot = int(mapping[0])
+    for index, block in enumerate(ctx.current_video_block_ids):
+        start = first_slot if index == 0 else block * BLOCK
+        kv._k_pools[0][start : (block + 1) * BLOCK] = float("nan")
+        kv._v_pools[0][start : (block + 1) * BLOCK] = float("nan")
+    k = torch.randn(ctx.seq_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    v = torch.randn(ctx.seq_len, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+    kv._k_pools[0][mapping] = k
+    kv._v_pools[0][mapping] = v
+    return k, v
+
+
+def _window_positions(end: int, *, sink: int, window: int, written, history: int, resident: set[int]) -> list[int]:
+    """Token positions attention must read at ``end``.
+
+    Every token of the current chunk, plus every written history token in a
+    block that is still resident and holds a sink token or one of the window's
+    most recent tokens.
+    """
+    start = end - window
+    blocks = {p // BLOCK for p in range(min(sink, end))} | {p // BLOCK for p in range(max(start, 0), end)}
+    return [p for p in sorted(written) if p >= history or (p // BLOCK in blocks and p // BLOCK in resident)]
+
+
+@pytest.mark.parametrize(
+    ("sink_chunks", "window_chunks", "reset_at_boundary"),
+    [(1, 2, False), (0, 2, False), (1, 3, False), (2, 2, True)],
+)
+def test_attention_after_eviction_reads_every_kept_token_and_nothing_unwritten(
+    sink_chunks, window_chunks, reset_at_boundary
+):
+    """Once the window slides, the table must still cover the window exactly.
+
+    The sink and the recent window are separate token ranges, and each can
+    straddle a block edge on its own: 24-token chunks against 16-token blocks
+    put a boundary 8 tokens past an edge on alternating chunks. Counting blocks
+    off the ends of the resident list dropped the block holding the window's
+    first tokens whenever both boundaries straddled, and the returned length
+    ran past the last written slot. Neither changes a shape, so this compares
+    values against dense attention over the tokens the window keeps -- after
+    eviction, with every unwritten slot poisoned, on both the scratch and the
+    committing forward of every chunk.
+
+    The reset case keeps only the sink across a boundary, so the recent window
+    reaches back over blocks that are no longer resident. Those must be skipped
+    by position rather than read.
+    """
+    torch.manual_seed(0)
+    device, dtype = torch.device("cpu"), torch.float32
+    kv, st = make_state(
+        device=device,
+        window_chunks=window_chunks,
+        sink_chunks=sink_chunks,
+        reset_at_boundary=reset_at_boundary,
+        chunk_size=RAGGED_CHUNK,
+    )
+    _poison_pools(kv)
+    sink, window = sink_chunks * RAGGED_CHUNK, int(kv.spec.sliding_window)
+    committed: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+    evicted = False
+
+    for chunk in range(8):
+        history = int(st.adapter(POS).num_computed_tokens)
+        end = history + RAGGED_CHUNK
+        for commit_current in (False, True):
+            ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=commit_current)[0].forward_ctx
+            ctx.ensure_video_slots(device)
+            k, v = _write_prepared_chunk(kv, ctx, dtype=dtype, device=device)
+            written = dict(committed)
+            written.update({history + i: (k[i], v[i]) for i in range(RAGGED_CHUNK)})
+
+            query = torch.randn(1, RAGGED_CHUNK, N_HEADS, HEAD_DIM, dtype=dtype, device=device)
+            block_table, query_start_loc, seq_lens, max_query_len, max_seq_len = ctx.build_block_table(
+                action_len=0, query_len=RAGGED_CHUNK, device=device
+            )
+            resident = {
+                index for index, block in enumerate(kv.block_table(st.adapter(POS))) if block != kv.null_block_id
+            }
+            positions = _window_positions(
+                end, sink=sink, window=window, written=written, history=history, resident=resident
+            )
+            label = f"chunk {chunk}, commit_current={commit_current}"
+            assert int(seq_lens[0]) == len(positions), f"{label}: kv_len does not match the written slots it covers"
+            paged = ar_diffusion_paged_attention(
+                query,
+                kv.key_cache(0),
+                kv.value_cache(0),
+                block_table=block_table,
+                query_start_loc=query_start_loc,
+                seq_lens=seq_lens,
+                max_query_len=max_query_len,
+                max_seq_len=max_seq_len,
+                softmax_scale=HEAD_DIM**-0.5,
+                causal=False,
+            )
+            ref = _dense_attention(
+                query,
+                torch.stack([written[p][0] for p in positions]).unsqueeze(0),
+                torch.stack([written[p][1] for p in positions]).unsqueeze(0),
+            )
+            torch.testing.assert_close(paged, ref, rtol=1e-5, atol=1e-5, msg=lambda m, label=label: f"{label}: {m}")
+        committed = written
+        st.commit_paged_context(POS)
+        evicted = evicted or kv.null_block_id in kv.block_table(st.adapter(POS))
+
+    assert evicted, "the window never slid, so nothing after eviction was tested"
+
+
+@pytest.mark.parametrize("commit_current", [False, True])
+def test_action_tokens_after_a_partly_written_video_block_are_refused(commit_current):
+    """Action K/V follows the video blocks in the table, and the kernel reads it as one run.
+
+    A 24-token chunk from an empty history ends 8 slots into its second 16-token
+    block, so the run would read those 8 unwritten slots as the first action
+    tokens and never reach the last ones. Every shape stays right, which is why
+    this is refused rather than computed.
+    """
+    _, st = make_state(window_chunks=2, chunk_size=RAGGED_CHUNK)
+    ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=commit_current)[0].forward_ctx
+    with pytest.raises(ValueError, match="partly written video block"):
+        ctx.build_block_table(action_len=3, query_len=RAGGED_CHUNK + 3, device=torch.device("cpu"))
+
+
+def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
+    """832x480 with the checkpoint's own sink and window, slot by slot.
+
+    A 9-frame sink and a 9-frame window are each 8 tokens past a 16-token edge
+    but 28080 tokens together -- a whole number of blocks -- so a width taken
+    from their sum was one block short on every tick once the window had
+    filled. Twelve ticks of three frames, checking every slot the kernel reads
+    against the token that slot is supposed to hold. No attention is computed:
+    at this size the bookkeeping is the whole question.
+    """
+    from vllm_omni.experimental.ar_diffusion.runner import paging_block_size
+
+    frame, frames_per_tick = (480 // 16) * (832 // 16), 3
+    block = paging_block_size(frame)
+    seq_len = frames_per_tick * frame
+    cfg = ARDiffusionKVConfig(enable=True, chunk_size=frame, window_chunks=9, sink_chunks=9)
+    kv = ARDiffusionKVCache(
+        cfg,
+        num_layers=1,
+        num_kv_heads=1,
+        head_size=8,
+        dtype=torch.float16,
+        block_size=block,
+        max_model_len=1 << 20,
+        available_bytes=1 << 27,
+        kv_branches=(ARDiffusionKVBranchSpec(POS, 0),),
+        session_capacity=1,
+        frames_per_block=frames_per_tick,
+        max_scratch_tokens_per_branch=seq_len,
+        device=torch.device("cpu"),
+    )
+    st = ARDiffusionKVState(kv, "s1", {POS: kv.begin_request("r-pos")}, num_layers=1)
+    sink, window = 9 * frame, int(kv.spec.sliding_window)
+    holds: dict[int, int] = {}  # slot -> token position last written there
+    widths: set[int] = set()
+    filled = False
+
+    for tick in range(12):
+        history = int(st.adapter(POS).num_computed_tokens)
+        end = history + seq_len
+        ctx = st.get_kv_caches(POS, seq_len=seq_len, commit_current=True)[0].forward_ctx
+        ctx.ensure_video_slots(torch.device("cpu"))
+        for offset, slot in enumerate(ctx.current_video_slot_mapping.tolist()):
+            holds[slot] = history + offset
+        table, _, seq_lens, _, _ = ctx.build_block_table(action_len=0, query_len=seq_len, device=torch.device("cpu"))
+        widths.add(int(table.shape[1]))
+        kv_len = int(seq_lens[0])
+
+        position_of_block = {
+            b: i * block for i, b in enumerate(kv.block_table(st.adapter(POS))) if b != kv.null_block_id
+        }
+        read = []
+        for b in table[0].tolist()[: -(-kv_len // block)]:
+            assert b in position_of_block, f"tick {tick}: read block {b}, which holds no token of this session"
+            read.extend((b * block + o, position_of_block[b] + o) for o in range(block))
+        read = read[:kv_len]
+        wrong = [(slot, want) for slot, want in read if holds.get(slot) != want]
+        assert not wrong, f"tick {tick}: {len(wrong)} slots read hold a token other than the one their position implies"
+
+        start = end - window
+        kept = set(range(min(sink, end))) | set(range(max(start, 0), end))
+        missed = kept - {want for _, want in read}
+        assert not missed, f"tick {tick}: {len(missed)} tokens the window keeps were not read"
+
+        filled = filled or end > sink + window
+        st.commit_paged_context(POS)
+
+    assert filled, "the window never filled, so the case that fails was never reached"
+    assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
 
 
 def test_the_checkpoints_own_default_resolution_can_build_a_cache():

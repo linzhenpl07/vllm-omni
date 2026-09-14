@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import itertools
 import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -288,13 +287,13 @@ class ARDiffusionPagedForwardContext:
         # Only two index ranges can hold a token the window keeps: the sink's
         # blocks, and the blocks from the recent window's start onward. The table
         # keeps a null entry for every evicted position, so it grows with the
-        # session; reading just these two ranges keeps this at the window's size.
-        table = self.kv_cache.block_table(self.adapter)
+        # session; reading just these two ranges, without copying the table,
+        # keeps this at the window's size.
         history_blocks = -(-history // block_size)
         sink_blocks = min(-(-sink_end // block_size), history_blocks)
         recent_first_block = max(max(recent_start, 0) // block_size, sink_blocks)
-        for index in itertools.chain(range(sink_blocks), range(recent_first_block, history_blocks)):
-            block = int(table[index])
+        indices = [*range(sink_blocks), *range(recent_first_block, history_blocks)]
+        for index, block in zip(indices, self.kv_cache.block_ids_at(self.adapter, indices)):
             if block != self.kv_cache.null_block_id:
                 first_position.setdefault(block, index * block_size)
         current_start = history - self._current_offset

@@ -794,17 +794,33 @@ def test_the_shipped_geometry_reads_exactly_the_window_on_every_tick():
     assert len(widths) == 1, f"block table width varied across ticks: {sorted(widths)}"
 
 
-class _CountingTable(list):
-    """A block table that counts reads by index."""
+class _CountedBlockIds:
+    """Wraps a vLLM block manager's ``get_blocks`` and counts the block ids read.
 
-    def __init__(self, items):
-        super().__init__(items)
+    Every path to a request's block ids goes through ``get_blocks``, so a copy of
+    the whole table is counted in full even if only a few entries are indexed.
+    """
+
+    def __init__(self, manager):
         self.reads = 0
+        self._get_blocks = manager.get_blocks
 
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            self.reads += 1
-        return super().__getitem__(key)
+    def __call__(self, request_id):
+        from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+
+        blocks = self._get_blocks(request_id)
+        return KVCacheBlocks(tuple([_CountedBlock(block, self) for block in group] for group in blocks.blocks))
+
+
+class _CountedBlock:
+    def __init__(self, block, counter: _CountedBlockIds):
+        self._block = block
+        self._counter = counter
+
+    @property
+    def block_id(self) -> int:
+        self._counter.reads += 1
+        return self._block.block_id
 
 
 def test_reading_the_window_touches_only_the_blocks_it_can_keep():
@@ -813,25 +829,24 @@ def test_reading_the_window_touches_only_the_blocks_it_can_keep():
     Every evicted position stays in the table as a null entry, so walking the
     whole table costs more on every tick of a long session. Only the sink's
     blocks and the recent window's blocks can hold a kept token, so those are
-    all the read may index -- checked on a session long enough that the table is
-    many times the window.
+    all the read may touch -- checked on a session long enough that the table is
+    many times the window, and counted where the ids leave vLLM's block manager.
     """
     device = torch.device("cpu")
     kv, st = make_state(device=device, window_chunks=2, sink_chunks=1, chunk_size=RAGGED_CHUNK)
-    real_block_table = kv.block_table
     reads: list[int] = []
     table_lengths: list[int] = []
     for _ in range(60):
         ctx = st.get_kv_caches(POS, seq_len=RAGGED_CHUNK, commit_current=True)[0].forward_ctx
         ctx.ensure_video_slots(device)
-        counted = _CountingTable(real_block_table(st.adapter(POS)))
-        kv.block_table = lambda adapter, counted=counted: counted
+        counted = _CountedBlockIds(kv.manager)
+        kv.manager.get_blocks = counted
         try:
             ctx.build_block_table(action_len=0, query_len=RAGGED_CHUNK, device=device)
         finally:
-            del kv.block_table
+            del kv.manager.get_blocks
         reads.append(counted.reads)
-        table_lengths.append(len(counted))
+        table_lengths.append(len(kv.block_table(st.adapter(POS))))
         st.commit_paged_context(POS)
 
     assert table_lengths[-1] > 10 * ctx.max_video_blocks, "the table never outgrew the window, so nothing was tested"
